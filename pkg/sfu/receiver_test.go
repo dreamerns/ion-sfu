@@ -81,6 +81,9 @@ func BenchmarkWriteRTP(b *testing.B) {
 		b.Run(fmt.Sprintf("%d-Downtracks/LoadBalanced", c), func(b *testing.B) {
 			benchmarkLoadBalanced(b, workers, 2, c)
 		})
+		b.Run(fmt.Sprintf("%d-Downtracks/LBPool", c), func(b *testing.B) {
+			benchmarkLoadBalancedPool(b, wp, workers, 2, c)
+		})
 	}
 }
 
@@ -154,6 +157,33 @@ func benchmarkLoadBalanced(b *testing.B, numProcs, step, downTracks int) {
 					}
 				}
 			}()
+		}
+		wg.Wait()
+	}
+}
+
+func benchmarkLoadBalancedPool(b *testing.B, wp *workerpool.WorkerPool, numProcs, step, downTracks int) {
+	for i := 0; i < b.N; i++ {
+		start := uint64(0)
+		step := uint64(step)
+		end := uint64(downTracks)
+
+		var wg sync.WaitGroup
+		wg.Add(numProcs)
+		for p := 0; p < numProcs; p++ {
+			wp.Submit(func() {
+				defer wg.Done()
+				for {
+					n := atomic.AddUint64(&start, step)
+					if n >= end+step {
+						return
+					}
+
+					for i := n - step; i < n && i < end; i++ {
+						writeRTP()
+					}
+				}
+			})
 		}
 		wg.Wait()
 	}
