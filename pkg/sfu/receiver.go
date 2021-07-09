@@ -304,10 +304,12 @@ func (w *WebRTCReceiver) DeleteDownTrack(peerID string) {
 
 	w.downTrackMu.Lock()
 	defer w.downTrackMu.Unlock()
+
 	idx, ok := w.index[peerID]
 	if !ok {
 		return
 	}
+	delete(w.index, peerID)
 	w.downTracks[idx] = nil
 	w.free[idx] = struct{}{}
 }
