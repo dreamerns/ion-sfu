@@ -36,6 +36,8 @@ type Receiver interface {
 	OnCloseHandler(fn func())
 	SendRTCP(p []rtcp.Packet)
 	SetRTCPCh(ch chan []rtcp.Packet)
+
+	DebugInfo() map[string]interface{}
 }
 
 // WebRTCReceiver receives a video track
@@ -44,7 +46,6 @@ type WebRTCReceiver struct {
 	trackID         string
 	streamID        string
 	kind            webrtc.RTPCodecType
-	bandwidth       uint64
 	stream          string
 	receiver        *webrtc.RTPReceiver
 	codec           webrtc.RTPCodecParameters
@@ -58,7 +59,7 @@ type WebRTCReceiver struct {
 
 	rtcpMu      sync.Mutex
 	rtcpCh      chan []rtcp.Packet
-	lastPli     int64
+	lastPli     atomicInt64
 	pliThrottle int64
 
 	bufferMu sync.RWMutex
@@ -215,9 +216,9 @@ func (w *WebRTCReceiver) AddDownTrack(track *DownTrack, bestQualityFirst bool) {
 		w.upTrackMu.RUnlock()
 
 		track.SetInitialLayers(int32(layer), 2)
-		track.maxSpatialLayer = 2
-		track.maxTemporalLayer = 2
-		track.lastSSRC = w.SSRC(layer)
+		track.maxSpatialLayer.set(2)
+		track.maxTemporalLayer.set(2)
+		track.lastSSRC.set(w.SSRC(layer))
 		track.trackType = SimulcastDownTrack
 		track.payload = packetFactory.Get().([]byte)
 	} else {
@@ -318,10 +319,10 @@ func (w *WebRTCReceiver) SendRTCP(p []rtcp.Packet) {
 	if _, ok := p[0].(*rtcp.PictureLossIndication); ok {
 		w.rtcpMu.Lock()
 		defer w.rtcpMu.Unlock()
-		if time.Now().UnixNano()-w.lastPli < w.pliThrottle {
+		if time.Now().UnixNano()-w.lastPli.get() < w.pliThrottle {
 			return
 		}
-		w.lastPli = time.Now().UnixNano()
+		w.lastPli.set(time.Now().UnixNano())
 	}
 
 	w.rtcpCh <- p
@@ -454,10 +455,12 @@ func (w *WebRTCReceiver) writeRTP(layer int32, dt *DownTrack, pkt *buffer.ExtPac
 				dt.SwitchSpatialLayerDone(targetLayer)
 				currentLayer = targetLayer
 			} else {
+				dt.lastPli.set(time.Now().UnixNano())
 				w.SendRTCP(pli)
 			}
 		}
 		if currentLayer != layer {
+			dt.pktsDropped.add(1)
 			return
 		}
 	}
@@ -484,4 +487,28 @@ func (w *WebRTCReceiver) closeTracks() {
 	if w.onCloseHandler != nil {
 		w.onCloseHandler()
 	}
+}
+
+func (w *WebRTCReceiver) DebugInfo() map[string]interface{} {
+	info := map[string]interface{}{
+		"Simulcast": w.isSimulcast,
+		"LastPli":   w.lastPli,
+	}
+
+	w.upTrackMu.RLock()
+	upTrackInfo := make([]map[string]interface{}, 0, len(w.upTracks))
+	for layer, ut := range w.upTracks {
+		if ut != nil {
+			upTrackInfo = append(upTrackInfo, map[string]interface{}{
+				"Layer": layer,
+				"SSRC":  ut.SSRC(),
+				"Msid":  ut.Msid(),
+				"RID":   ut.RID(),
+			})
+		}
+	}
+	w.upTrackMu.RUnlock()
+	info["UpTracks"] = upTrackInfo
+
+	return info
 }

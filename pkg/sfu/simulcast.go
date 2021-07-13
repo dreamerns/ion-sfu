@@ -17,14 +17,13 @@ type simulcastTrackHelpers struct {
 	switchDelay       time.Time
 	temporalSupported bool
 	temporalEnabled   bool
-	lTSCalc           int64
+	lTSCalc           atomicInt64
 
 	// VP8Helper temporal helpers
-	pRefPicID  uint16
-	refPicID   uint16
-	lPicID     uint16
-	pRefTlZIdx uint8
-	refTlZIdx  uint8
-	lTlZIdx    uint8
-	refSN      uint16
+	pRefPicID  atomicUint16
+	refPicID   atomicUint16
+	lPicID     atomicUint16
+	pRefTlZIdx atomicUint8
+	refTlZIdx  atomicUint8
+	lTlZIdx    atomicUint8
 }

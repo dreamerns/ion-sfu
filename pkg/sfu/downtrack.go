@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtcp"
@@ -42,16 +41,15 @@ type DownTrack struct {
 
 	currentSpatialLayer atomicInt32
 	targetSpatialLayer  atomicInt32
-	temporalLayer       int32
+	temporalLayer       atomicInt32
 
 	enabled  atomicBool
 	reSync   atomicBool
-	reBaseTs atomicBool
-	snOffset uint16
-	tsOffset uint32
-	lastSSRC uint32
-	lastSN   uint16
-	lastTS   uint32
+	lastSSRC atomicUint32
+	snOffset atomicUint16
+	lastSN   atomicUint16
+	tsOffset atomicUint32
+	lastTS   atomicUint32
 
 	simulcast        simulcastTrackHelpers
 	maxSpatialLayer  atomicInt32
@@ -66,10 +64,16 @@ type DownTrack struct {
 	closeOnce      sync.Once
 
 	// Report helpers
-	octetCount   uint32
-	packetCount  uint32
-	maxPacketTs  uint32
-	lastPacketMs int64
+	octetCount   atomicUint32
+	packetCount  atomicUint32
+	maxPacketTs  atomicUint32
+	lastPacketMs atomicInt64
+
+	// Debug info
+	lastPli     atomicInt64
+	lastRTP     atomicInt64
+	pktsMuted   atomicUint32
+	pktsDropped atomicUint32
 }
 
 // NewDownTrack returns a DownTrack.
@@ -95,7 +99,6 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 		d.payloadType = uint8(codec.PayloadType)
 		d.writeStream = t.WriteStream()
 		d.mime = strings.ToLower(codec.MimeType)
-		d.reBaseTs.set(true)
 		d.enabled.set(true)
 		d.reSync.set(true)
 		if rr := d.bufferFactory.GetOrNew(packetio.RTCPBufferPacket, uint32(t.SSRC())).(*buffer.RTCPReader); rr != nil {
@@ -152,9 +155,16 @@ func (d *DownTrack) SetTransceiver(transceiver *webrtc.RTPTransceiver) {
 
 // WriteRTP writes a RTP Packet to the DownTrack
 func (d *DownTrack) WriteRTP(p *buffer.ExtPacket) error {
-	if !d.enabled.get() || !d.bound.get() {
+	d.lastRTP.set(time.Now().UnixNano())
+
+	if !d.bound.get() {
 		return nil
 	}
+	if !d.enabled.get() {
+		d.pktsMuted.add(1)
+		return nil
+	}
+
 	switch d.trackType {
 	case SimpleDownTrack:
 		return d.writeSimpleRTP(p)
@@ -192,7 +202,7 @@ func (d *DownTrack) Close() {
 func (d *DownTrack) SetInitialLayers(spatialLayer, temporalLayer int32) {
 	d.currentSpatialLayer.set(spatialLayer)
 	d.targetSpatialLayer.set(spatialLayer)
-	atomic.StoreInt32(&d.temporalLayer, (temporalLayer<<16)|temporalLayer)
+	d.temporalLayer.set((temporalLayer << 16) | temporalLayer)
 }
 
 func (d *DownTrack) CurrentSpatialLayer() int32 {
@@ -266,7 +276,7 @@ func (d *DownTrack) UptrackLayersChange(availableLayers []uint16) (int32, error)
 
 func (d *DownTrack) SwitchTemporalLayer(targetLayer int32, setAsMax bool) {
 	if d.trackType == SimulcastDownTrack {
-		layer := atomic.LoadInt32(&d.temporalLayer)
+		layer := d.temporalLayer.get()
 		currentLayer := uint16(layer)
 		currentTargetLayer := uint16(layer >> 16)
 
@@ -274,7 +284,7 @@ func (d *DownTrack) SwitchTemporalLayer(targetLayer int32, setAsMax bool) {
 		if currentLayer != currentTargetLayer {
 			return
 		}
-		atomic.StoreInt32(&d.temporalLayer, (targetLayer<<16)|int32(currentLayer))
+		d.temporalLayer.set((targetLayer << 16) | int32(currentLayer))
 		if setAsMax {
 			d.maxTemporalLayer.set(targetLayer)
 		}
@@ -316,23 +326,20 @@ func (d *DownTrack) CreateSenderReport() *rtcp.SenderReport {
 		return nil
 	}
 	now := time.Now().UnixNano()
-	nowNTP := timeToNtp(now)
-	lastPktMs := atomic.LoadInt64(&d.lastPacketMs)
-	maxPktTs := atomic.LoadUint32(&d.lastTS)
-	diffTs := uint32((now/1e6)-lastPktMs) * d.codec.ClockRate / 1000
-	octets, packets := d.getSRStats()
+	maxPktTs := d.lastTS.get()
+	diffTs := uint32((now/1e6)-d.lastPacketMs.get()) * d.codec.ClockRate / 1000
 	return &rtcp.SenderReport{
 		SSRC:        d.ssrc,
-		NTPTime:     nowNTP,
+		NTPTime:     timeToNtp(now),
 		RTPTime:     maxPktTs + diffTs,
-		PacketCount: packets,
-		OctetCount:  octets,
+		PacketCount: d.packetCount.get(),
+		OctetCount:  d.octetCount.get(),
 	}
 }
 
 func (d *DownTrack) UpdateStats(packetLen uint32) {
-	atomic.AddUint32(&d.octetCount, packetLen)
-	atomic.AddUint32(&d.packetCount, 1)
+	d.octetCount.add(packetLen)
+	d.packetCount.add(1)
 }
 
 func (d *DownTrack) writeSimpleRTP(extPkt *buffer.ExtPacket) error {
@@ -342,30 +349,33 @@ func (d *DownTrack) writeSimpleRTP(extPkt *buffer.ExtPacket) error {
 				d.receiver.SendRTCP([]rtcp.Packet{
 					&rtcp.PictureLossIndication{SenderSSRC: d.ssrc, MediaSSRC: extPkt.Packet.SSRC},
 				})
+				d.lastPli.set(time.Now().UnixNano())
+				d.pktsDropped.add(1)
 				return nil
 			}
 		}
-		if d.reBaseTs.get() {
-			d.snOffset = extPkt.Packet.SequenceNumber - d.lastSN - 1
-			d.tsOffset = extPkt.Packet.Timestamp - d.lastTS - 1
-			d.reBaseTs.set(false)
-		}
-		atomic.StoreUint32(&d.lastSSRC, extPkt.Packet.SSRC)
+
+		d.snOffset.set(extPkt.Packet.SequenceNumber - d.lastSN.get() - 1)
+		d.tsOffset.set(extPkt.Packet.Timestamp - d.lastTS.get() - 1)
+		d.lastSSRC.set(extPkt.Packet.SSRC)
 		d.reSync.set(false)
 	}
 
 	d.UpdateStats(uint32(len(extPkt.Packet.Payload)))
 
-	newSN := extPkt.Packet.SequenceNumber - d.snOffset
-	newTS := extPkt.Packet.Timestamp - d.tsOffset
+	newSN := extPkt.Packet.SequenceNumber - d.snOffset.get()
+	newTS := extPkt.Packet.Timestamp - d.tsOffset.get()
+
 	if d.sequencer != nil {
 		d.sequencer.push(extPkt.Packet.SequenceNumber, newSN, newTS, 0, extPkt.Head)
 	}
-	if (newSN-d.lastSN)&0x8000 == 0 || d.lastSN == 0 {
-		d.lastSN = newSN
-		atomic.StoreInt64(&d.lastPacketMs, extPkt.Arrival/1e6)
-		atomic.StoreUint32(&d.lastTS, newTS)
+
+	if lastSN := d.lastSN.get(); (newSN-lastSN)&0x8000 == 0 || lastSN == 0 {
+		d.lastSN.set(newSN)
+		d.lastTS.set(newTS)
+		d.lastPacketMs.set(extPkt.Arrival / 1e6)
 	}
+
 	hdr := extPkt.Packet.Header
 	hdr.PayloadType = d.payloadType
 	hdr.Timestamp = newTS
@@ -383,7 +393,7 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket) error {
 	// Check if packet SSRC is different from before
 	// if true, the video source changed
 	reSync := d.reSync.get()
-	lastSSRC := atomic.LoadUint32(&d.lastSSRC)
+	lastSSRC := d.lastSSRC.get()
 	if lastSSRC != extPkt.Packet.SSRC || reSync {
 		// Wait for a keyframe to sync new source
 		if reSync && !extPkt.KeyFrame {
@@ -391,19 +401,21 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket) error {
 			d.receiver.SendRTCP([]rtcp.Packet{
 				&rtcp.PictureLossIndication{SenderSSRC: d.ssrc, MediaSSRC: extPkt.Packet.SSRC},
 			})
+			d.lastPli.set(time.Now().UnixNano())
+			d.pktsDropped.add(1)
 			return nil
 		}
-		if reSync && d.simulcast.lTSCalc != 0 {
-			d.simulcast.lTSCalc = extPkt.Arrival
+		if reSync && d.simulcast.lTSCalc.get() != 0 {
+			d.simulcast.lTSCalc.set(extPkt.Arrival)
 		}
 
 		if d.simulcast.temporalSupported {
 			if d.mime == "video/vp8" {
 				if vp8, ok := extPkt.Payload.(buffer.VP8); ok {
-					d.simulcast.pRefPicID = d.simulcast.lPicID
-					d.simulcast.refPicID = vp8.PictureID
-					d.simulcast.pRefTlZIdx = d.simulcast.lTlZIdx
-					d.simulcast.refTlZIdx = vp8.TL0PICIDX
+					d.simulcast.pRefPicID.set(d.simulcast.lPicID.get())
+					d.simulcast.refPicID.set(vp8.PictureID)
+					d.simulcast.pRefTlZIdx.set(d.simulcast.lTlZIdx.get())
+					d.simulcast.refTlZIdx.set(vp8.TL0PICIDX)
 				}
 			}
 		}
@@ -411,26 +423,28 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket) error {
 	}
 	// Compute how much time passed between the old RTP extPkt
 	// and the current packet, and fix timestamp on source change
-	if d.simulcast.lTSCalc != 0 && lastSSRC != extPkt.Packet.SSRC {
-		atomic.StoreUint32(&d.lastSSRC, extPkt.Packet.SSRC)
-		tDiff := (extPkt.Arrival - d.simulcast.lTSCalc) / 1e6
+	lTSCalc := d.simulcast.lTSCalc.get()
+	if lTSCalc != 0 && lastSSRC != extPkt.Packet.SSRC {
+		d.lastSSRC.set(extPkt.Packet.SSRC)
+		tDiff := (extPkt.Arrival - lTSCalc) / 1e6
 		td := uint32((tDiff * 90) / 1000)
 		if td == 0 {
 			td = 1
 		}
-		d.tsOffset = extPkt.Packet.Timestamp - (d.lastTS + td)
-		d.snOffset = extPkt.Packet.SequenceNumber - d.lastSN - 1
-	} else if d.simulcast.lTSCalc == 0 {
-		d.lastTS = extPkt.Packet.Timestamp
-		d.lastSN = extPkt.Packet.SequenceNumber
+		d.tsOffset.set(extPkt.Packet.Timestamp - (d.lastTS.get() + td))
+		d.snOffset.set(extPkt.Packet.SequenceNumber - d.lastSN.get() - 1)
+	} else if lTSCalc == 0 {
+		d.lastTS.set(extPkt.Packet.Timestamp)
+		d.lastSN.set(extPkt.Packet.SequenceNumber)
 		if d.mime == "video/vp8" {
 			if vp8, ok := extPkt.Payload.(buffer.VP8); ok {
 				d.simulcast.temporalSupported = vp8.TemporalSupported
 			}
 		}
 	}
-	newSN := extPkt.Packet.SequenceNumber - d.snOffset
-	newTS := extPkt.Packet.Timestamp - d.tsOffset
+
+	newSN := extPkt.Packet.SequenceNumber - d.snOffset.get()
+	newTS := extPkt.Packet.Timestamp - d.tsOffset.get()
 	payload := extPkt.Packet.Payload
 
 	var (
@@ -442,7 +456,7 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket) error {
 			drop := false
 			if picID, tlz0Idx, drop = setVP8TemporalLayer(extPkt, d); drop {
 				// Pkt not in temporal getLayer update sequence number offset to avoid gaps
-				d.snOffset++
+				d.snOffset.add(1)
 				return nil
 			}
 			payload = d.payload
@@ -457,17 +471,16 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket) error {
 		}
 	}
 
-	atomic.AddUint32(&d.octetCount, uint32(len(extPkt.Packet.Payload)))
-	atomic.AddUint32(&d.packetCount, 1)
+	d.UpdateStats(uint32(len(extPkt.Packet.Payload)))
 
 	if extPkt.Head {
-		d.lastSN = newSN
-		d.lastTS = newTS
-		atomic.StoreInt64(&d.lastPacketMs, time.Now().UnixNano()/1e6)
-		atomic.StoreUint32(&d.lastTS, newTS)
+		d.lastSN.set(newSN)
+		d.lastTS.set(newTS)
+		d.lastPacketMs.set(time.Now().UnixNano() / 1e6)
 	}
+
 	// Update base
-	d.simulcast.lTSCalc = extPkt.Arrival
+	d.simulcast.lTSCalc.set(extPkt.Arrival)
 	// Update extPkt headers
 	hdr := extPkt.Packet.Header
 	hdr.SequenceNumber = newSN
@@ -502,7 +515,7 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 		expectedMinBitrate uint64
 	)
 
-	ssrc := atomic.LoadUint32(&d.lastSSRC)
+	ssrc := d.lastSSRC.get()
 	if ssrc == 0 {
 		return
 	}
@@ -510,6 +523,7 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 		switch p := pkt.(type) {
 		case *rtcp.PictureLossIndication:
 			if pliOnce {
+				d.lastPli.set(time.Now().UnixNano())
 				p.MediaSSRC = ssrc
 				p.SenderSSRC = d.ssrc
 				fwdPkts = append(fwdPkts, p)
@@ -552,12 +566,10 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 }
 
 func (d *DownTrack) handleLayerChange(maxRatePacketLoss uint8, expectedMinBitrate uint64) {
-	d.mu.RLock()
 	currentSpatialLayer := d.CurrentSpatialLayer()
 	targetSpatialLayer := d.TargetSpatialLayer()
-	d.mu.RUnlock()
 
-	temporalLayer := atomic.LoadInt32(&d.temporalLayer)
+	temporalLayer := d.temporalLayer.get()
 	currentTemporalLayer := temporalLayer & 0x0f
 	targetTemporalLayer := temporalLayer >> 16
 
@@ -599,8 +611,35 @@ func (d *DownTrack) handleLayerChange(maxRatePacketLoss uint8, expectedMinBitrat
 	}
 }
 
-func (d *DownTrack) getSRStats() (octets, packets uint32) {
-	octets = atomic.LoadUint32(&d.octetCount)
-	packets = atomic.LoadUint32(&d.packetCount)
-	return
+func (d *DownTrack) DebugInfo() map[string]interface{} {
+	stats := map[string]interface{}{
+		"LastSN":         d.lastSN.get(),
+		"SNOffset":       d.snOffset.get(),
+		"LastTS":         d.lastTS.get(),
+		"TSOffset":       d.tsOffset.get(),
+		"LastRTP":        d.lastRTP.get(),
+		"LastPli":        d.lastPli.get(),
+		"PacketsDropped": d.pktsDropped.get(),
+		"PacketsMuted":   d.pktsMuted.get(),
+	}
+
+	senderReport := d.CreateSenderReport()
+	if senderReport != nil {
+		stats["NTPTime"] = senderReport.NTPTime
+		stats["RTPTime"] = senderReport.RTPTime
+		stats["PacketCount"] = senderReport.PacketCount
+	}
+
+	return map[string]interface{}{
+		"PeerID":              d.peerID,
+		"TrackID":             d.id,
+		"StreamID":            d.streamID,
+		"SSRC":                d.ssrc,
+		"MimeType":            d.codec.MimeType,
+		"Bound":               d.bound.get(),
+		"Enabled":             d.enabled.get(),
+		"Resync":              d.reSync.get(),
+		"CurrentSpatialLayer": d.CurrentSpatialLayer(),
+		"Stats":               stats,
+	}
 }

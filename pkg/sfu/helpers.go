@@ -3,39 +3,15 @@ package sfu
 import (
 	"encoding/binary"
 	"strings"
-	"sync/atomic"
+
+	"github.com/pion/webrtc/v3"
 
 	"github.com/pion/ion-sfu/pkg/buffer"
-	"github.com/pion/webrtc/v3"
 )
 
 const (
 	ntpEpoch = 2208988800
 )
-
-type atomicBool int32
-
-func (a *atomicBool) set(value bool) {
-	var i int32
-	if value {
-		i = 1
-	}
-	atomic.StoreInt32((*int32)(a), i)
-}
-
-func (a *atomicBool) get() bool {
-	return atomic.LoadInt32((*int32)(a)) != 0
-}
-
-type atomicInt32 int32
-
-func (a *atomicInt32) set(value int32) {
-	atomic.StoreInt32((*int32)(a), value)
-}
-
-func (a *atomicInt32) get() int32 {
-	return atomic.LoadInt32((*int32)(a))
-}
 
 // setVp8TemporalLayer is a helper to detect and modify accordingly the vp8 payload to reflect
 // temporal changes in the SFU.
@@ -46,13 +22,13 @@ func setVP8TemporalLayer(p *buffer.ExtPacket, d *DownTrack) (picID uint16, tlz0I
 		return 0, 0, false
 	}
 
-	layer := atomic.LoadInt32(&d.temporalLayer)
+	layer := d.temporalLayer.get()
 	currentLayer := uint16(layer)
 	currentTargetLayer := uint16(layer >> 16)
 	// Check if temporal getLayer is requested
 	if currentTargetLayer != currentLayer {
 		if pkt.TID <= uint8(currentTargetLayer) {
-			atomic.StoreInt32(&d.temporalLayer, int32(currentTargetLayer)<<16|int32(currentTargetLayer))
+			d.temporalLayer.set(int32(currentTargetLayer)<<16 | int32(currentTargetLayer))
 		}
 	} else if pkt.TID > uint8(currentLayer) {
 		drop = true
@@ -62,12 +38,12 @@ func setVP8TemporalLayer(p *buffer.ExtPacket, d *DownTrack) (picID uint16, tlz0I
 	d.payload = d.payload[:len(p.Packet.Payload)]
 	copy(d.payload, p.Packet.Payload)
 
-	picID = pkt.PictureID - d.simulcast.refPicID + d.simulcast.pRefPicID + 1
-	tlz0Idx = pkt.TL0PICIDX - d.simulcast.refTlZIdx + d.simulcast.pRefTlZIdx + 1
+	picID = pkt.PictureID - d.simulcast.refPicID.get() + d.simulcast.pRefPicID.get() + 1
+	tlz0Idx = pkt.TL0PICIDX - d.simulcast.refTlZIdx.get() + d.simulcast.pRefTlZIdx.get() + 1
 
 	if p.Head {
-		d.simulcast.lPicID = picID
-		d.simulcast.lTlZIdx = tlz0Idx
+		d.simulcast.lPicID.set(picID)
+		d.simulcast.lTlZIdx.set(tlz0Idx)
 	}
 
 	modifyVP8TemporalPayload(d.payload, pkt.PicIDIdx, pkt.TlzIdx, picID, tlz0Idx, pkt.MBit)
