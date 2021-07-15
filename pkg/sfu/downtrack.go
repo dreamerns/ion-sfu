@@ -49,6 +49,8 @@ type DownTrack struct {
 	lastSN   atomicUint16
 	tsOffset atomicUint32
 	lastTS   atomicUint32
+	snOffset uint16
+	tsOffset uint32
 
 	simulcast        simulcastTrackHelpers
 	maxSpatialLayer  atomicInt32
