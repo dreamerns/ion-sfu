@@ -264,7 +264,9 @@ func (w *WebRTCReceiver) SetAvailableLayers(layers []uint16) {
 	w.downTrackMu.RLock()
 	defer w.downTrackMu.RUnlock()
 	for _, dt := range w.downTracks {
-		_, _ = dt.UptrackLayersChange(layers)
+		if dt != nil {
+			_, _ = dt.UptrackLayersChange(layers)
+		}
 	}
 }
 
