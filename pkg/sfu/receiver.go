@@ -73,13 +73,27 @@ type WebRTCReceiver struct {
 	index       map[string]int
 	free        map[int]struct{}
 	numProcs    int
+	lbThreshold int
 }
 
 type ReceiverOpts func(w *WebRTCReceiver) *WebRTCReceiver
 
+// Minimum time, in ms, between sending PLIs
 func WithPliThrottle(period int64) ReceiverOpts {
 	return func(w *WebRTCReceiver) *WebRTCReceiver {
 		w.pliThrottle = period * 1e6
+		return w
+	}
+}
+
+// Parallelize packet writes when number of down tracks crosses threshold.
+// Value should be between 3 and 150.
+// For a server handling a few large rooms, use a smaller value (required to handle very large (250+ participant) rooms).
+// For a server handling many small rooms, use a larger value or disable.
+// Set to 0 (disabled) by default.
+func WithLoadBalanceThreshold(downTracks int) ReceiverOpts {
+	return func(w *WebRTCReceiver) *WebRTCReceiver {
+		w.lbThreshold = downTracks
 		return w
 	}
 }
@@ -407,7 +421,7 @@ func (w *WebRTCReceiver) forwardRTP(layer int32) {
 		}
 
 		w.downTrackMu.RLock()
-		if len(w.downTracks)-len(w.free) < 5 {
+		if w.lbThreshold == 0 || len(w.downTracks)-len(w.free) < w.lbThreshold {
 			// serial - not enough down tracks for parallelization to outweigh overhead
 			for _, dt := range w.downTracks {
 				if dt != nil {
