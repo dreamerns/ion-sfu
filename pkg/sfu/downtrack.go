@@ -56,13 +56,14 @@ type DownTrack struct {
 	maxSpatialLayer  atomicInt32
 	maxTemporalLayer atomicInt32
 
-	codec          webrtc.RTPCodecCapability
-	receiver       Receiver
-	transceiver    *webrtc.RTPTransceiver
-	writeStream    webrtc.TrackLocalWriter
-	onCloseHandler func()
-	onBind         func()
-	closeOnce      sync.Once
+	codec            webrtc.RTPCodecCapability
+	receiver         Receiver
+	transceiver      *webrtc.RTPTransceiver
+	writeStream      webrtc.TrackLocalWriter
+	onCloseHandler   func()
+	onBind           func()
+	onReceiverReport func(*rtcp.ReceiverReport)
+	closeOnce        sync.Once
 
 	// Report helpers
 	octetCount   atomicUint32
@@ -564,6 +565,7 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 					maxRatePacketLoss = r.FractionLost
 				}
 			}
+			d.onReceiverReport(p)
 		case *rtcp.TransportLayerNack:
 			var nackedPackets []packetMeta
 			for _, pair := range p.Nacks {
