@@ -83,6 +83,7 @@ type DownTrack struct {
 	receiverReportListeners []ReceiverReportListener
 	listenerLock            sync.RWMutex
 	closeOnce               sync.Once
+	onReceiverReport        func(*rtcp.ReceiverReport)
 
 	// Report helpers
 	octetCount   atomicUint32
@@ -1109,6 +1110,7 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 					maxRatePacketLoss = r.FractionLost
 				}
 			}
+
 			d.lossFraction.set(maxRatePacketLoss)
 			if len(rr.Reports) > 0 {
 				d.listenerLock.RLock()
@@ -1117,6 +1119,8 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 				}
 				d.listenerLock.RUnlock()
 			}
+			// !nn! - is this still needed
+			// d.onReceiverReport(p)
 		case *rtcp.TransportLayerNack:
 			var nackedPackets []packetMeta
 			for _, pair := range p.Nacks {
