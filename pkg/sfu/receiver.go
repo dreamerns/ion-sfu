@@ -220,7 +220,7 @@ func (w *WebRTCReceiver) AddDownTrack(track *DownTrack, bestQualityFirst bool) {
 	if w.isSimulcast {
 		w.upTrackMu.RLock()
 		for i, t := range w.upTracks {
-			if t != nil {
+			if t != nil && w.HasSpatialLayer(int32(i)) {
 				layer = i
 				if !bestQualityFirst {
 					break
