@@ -1,6 +1,7 @@
 package sfu
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/pion/rtcp"
@@ -242,6 +243,7 @@ func (r *router) AddDownTrack(sub *Subscriber, recv Receiver) (*DownTrack, error
 	}
 
 	codec := recv.Codec()
+	fmt.Println("GOT RECEIVER CODEC: ", codec)
 	if err := sub.me.RegisterCodec(codec, recv.Kind()); err != nil {
 		return nil, err
 	}
@@ -274,6 +276,9 @@ func (r *router) AddDownTrack(sub *Subscriber, recv Receiver) (*DownTrack, error
 		Direction: webrtc.RTPTransceiverDirectionSendonly,
 	}); err != nil {
 		return nil, err
+	}
+	if err := downTrack.transceiver.SetCodecPreferences([]webrtc.RTPCodecParameters{recv.Codec()}); err != nil {
+		Logger.Error(err, "error setting codec pref on downtrack: ", err)
 	}
 
 	// nolint:scopelint
