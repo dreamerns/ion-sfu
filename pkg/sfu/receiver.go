@@ -27,8 +27,8 @@ type Receiver interface {
 	SSRC(layer int) uint32
 	AddUpTrack(track *webrtc.TrackRemote, buffer *buffer.Buffer, bestQualityFirst bool)
 	AddDownTrack(track *DownTrack, bestQualityFirst bool)
+	SetUpTrackPaused(paused bool)
 	HasSpatialLayer(layer int32) bool
-	SetAvailableLayers(layers []uint16)
 	GetBitrate() [3]uint64
 	GetMaxTemporalLayer() [3]int32
 	RetransmitPackets(track *DownTrack, packets []packetMeta) error
@@ -56,6 +56,8 @@ type WebRTCReceiver struct {
 	onCloseHandler  func()
 	closeOnce       sync.Once
 	closed          atomicBool
+	trackers        [3]*StreamTracker
+	useTrackers     bool
 
 	rtcpMu      sync.Mutex
 	rtcpCh      chan []rtcp.Packet
@@ -78,7 +80,7 @@ type WebRTCReceiver struct {
 
 type ReceiverOpts func(w *WebRTCReceiver) *WebRTCReceiver
 
-// Minimum time, in ms, between sending PLIs
+// WithPliThrottle indicates minimum time(ms) between sending PLIs
 func WithPliThrottle(period int64) ReceiverOpts {
 	return func(w *WebRTCReceiver) *WebRTCReceiver {
 		w.pliThrottle = period * 1e6
@@ -86,7 +88,15 @@ func WithPliThrottle(period int64) ReceiverOpts {
 	}
 }
 
-// Parallelize packet writes when number of down tracks crosses threshold.
+// WithStreamTrackers enables StreamTracker use for simulcast
+func WithStreamTrackers() ReceiverOpts {
+	return func(w *WebRTCReceiver) *WebRTCReceiver {
+		w.useTrackers = true
+		return w
+	}
+}
+
+// WithLoadBalanceThreshold enables parallelization of packet writes when downTracks exceeds threshold
 // Value should be between 3 and 150.
 // For a server handling a few large rooms, use a smaller value (required to handle very large (250+ participant) rooms).
 // For a server handling many small rooms, use a larger value or disable.
@@ -167,21 +177,6 @@ func (w *WebRTCReceiver) AddUpTrack(track *webrtc.TrackRemote, buff *buffer.Buff
 
 	w.upTrackMu.Lock()
 	w.upTracks[layer] = track
-	layers, ok := w.availableLayers.Load().([]uint16)
-	if !ok {
-		layers = make([]uint16, 0, 3)
-	}
-	hasLayer := false
-	for _, l := range layers {
-		if l == uint16(layer) {
-			hasLayer = true
-			break
-		}
-	}
-	if !hasLayer {
-		layers = append(layers, uint16(layer))
-	}
-	w.availableLayers.Store(layers)
 	w.upTrackMu.Unlock()
 
 	w.bufferMu.Lock()
@@ -189,6 +184,8 @@ func (w *WebRTCReceiver) AddUpTrack(track *webrtc.TrackRemote, buff *buffer.Buff
 	w.bufferMu.Unlock()
 
 	if w.isSimulcast {
+		w.addAvailableLayer(uint16(layer), false)
+
 		w.downTrackMu.RLock()
 		for _, dt := range w.downTracks {
 			if dt != nil {
@@ -199,8 +196,38 @@ func (w *WebRTCReceiver) AddUpTrack(track *webrtc.TrackRemote, buff *buffer.Buff
 			}
 		}
 		w.downTrackMu.RUnlock()
+
+		// always publish lowest layer
+		if layer != 0 && w.useTrackers {
+			tracker := NewStreamTracker()
+			w.trackers[layer] = tracker
+			tracker.OnStatusChanged = func(status StreamStatus) {
+				if status == StreamStatusStopped {
+					w.removeAvailableLayer(uint16(layer))
+				} else {
+					w.addAvailableLayer(uint16(layer), true)
+				}
+			}
+			tracker.Start()
+		}
 	}
 	go w.forwardRTP(layer)
+}
+
+// SetUpTrackPaused indicates upstream will not be sending any data.
+// this will reflect the "muted" status and will pause streamtracker to ensure we don't turn off
+// the layer
+func (w *WebRTCReceiver) SetUpTrackPaused(paused bool) {
+	if !w.isSimulcast {
+		return
+	}
+	w.upTrackMu.Lock()
+	defer w.upTrackMu.Unlock()
+	for _, tracker := range w.trackers {
+		if tracker != nil {
+			tracker.SetPaused(paused)
+		}
+	}
 }
 
 func (w *WebRTCReceiver) AddDownTrack(track *DownTrack, bestQualityFirst bool) {
@@ -268,13 +295,7 @@ func (w *WebRTCReceiver) HasSpatialLayer(layer int32) bool {
 	return false
 }
 
-func (w *WebRTCReceiver) SetAvailableLayers(layers []uint16) {
-	if layers == nil {
-		return
-	}
-	w.upTrackMu.Lock()
-	w.availableLayers.Store(layers)
-	w.upTrackMu.Unlock()
+func (w *WebRTCReceiver) downtrackLayerChange(layers []uint16) {
 	w.downTrackMu.RLock()
 	defer w.downTrackMu.RUnlock()
 	for _, dt := range w.downTracks {
@@ -282,6 +303,49 @@ func (w *WebRTCReceiver) SetAvailableLayers(layers []uint16) {
 			_, _ = dt.UptrackLayersChange(layers)
 		}
 	}
+}
+
+func (w *WebRTCReceiver) addAvailableLayer(layer uint16, updateDownTrack bool) {
+	w.upTrackMu.Lock()
+	layers, ok := w.availableLayers.Load().([]uint16)
+	if !ok {
+		layers = []uint16{}
+	}
+	hasLayer := false
+	for _, l := range layers {
+		if l == layer {
+			hasLayer = true
+			break
+		}
+	}
+	if !hasLayer {
+		layers = append(layers, layer)
+	}
+	w.availableLayers.Store(layers)
+	w.upTrackMu.Unlock()
+
+	if updateDownTrack {
+		w.downtrackLayerChange(layers)
+	}
+}
+
+func (w *WebRTCReceiver) removeAvailableLayer(layer uint16) {
+	w.upTrackMu.Lock()
+	layers, ok := w.availableLayers.Load().([]uint16)
+	if !ok {
+		w.upTrackMu.Unlock()
+		return
+	}
+	newLayers := make([]uint16, 0, 3)
+	for _, l := range layers {
+		if l != layer {
+			newLayers = append(newLayers, l)
+		}
+	}
+	w.availableLayers.Store(newLayers)
+	w.upTrackMu.Unlock()
+	// need to immediately switch off unavailable layers
+	w.downtrackLayerChange(newLayers)
 }
 
 func (w *WebRTCReceiver) GetBitrate() [3]uint64 {
@@ -401,16 +465,20 @@ func (w *WebRTCReceiver) RetransmitPackets(track *DownTrack, packets []packetMet
 }
 
 func (w *WebRTCReceiver) forwardRTP(layer int32) {
+	pli := []rtcp.Packet{
+		&rtcp.PictureLossIndication{SenderSSRC: rand.Uint32(), MediaSSRC: w.SSRC(int(layer))},
+	}
+	tracker := w.trackers[layer]
+
 	defer func() {
 		w.closeOnce.Do(func() {
 			w.closed.set(true)
 			w.closeTracks()
 		})
+		if tracker != nil {
+			tracker.Stop()
+		}
 	}()
-
-	pli := []rtcp.Packet{
-		&rtcp.PictureLossIndication{SenderSSRC: rand.Uint32(), MediaSSRC: w.SSRC(int(layer))},
-	}
 
 	for {
 		w.bufferMu.RLock()
@@ -418,6 +486,10 @@ func (w *WebRTCReceiver) forwardRTP(layer int32) {
 		w.bufferMu.RUnlock()
 		if err == io.EOF {
 			return
+		}
+
+		if tracker != nil {
+			tracker.Observe(pkt.Packet.SequenceNumber)
 		}
 
 		w.downTrackMu.RLock()
