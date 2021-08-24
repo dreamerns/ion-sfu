@@ -16,6 +16,8 @@ type Router interface {
 	ID() string
 	AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.TrackRemote) (Receiver, bool)
 	AddDownTracks(s *Subscriber, r Receiver) error
+	SetRTCPWriter(func([]rtcp.Packet) error)
+	AddDownTrack(s *Subscriber, r Receiver) (*DownTrack, error)
 	Stop()
 }
 
@@ -35,7 +37,6 @@ type router struct {
 	sync.RWMutex
 	id            string
 	twcc          *twcc.Responder
-	peer          *webrtc.PeerConnection
 	stats         map[uint32]*stats.Stream
 	rtcpCh        chan []rtcp.Packet
 	stopCh        chan struct{}
@@ -43,14 +44,14 @@ type router struct {
 	session       Session
 	receivers     map[string]Receiver
 	bufferFactory *buffer.Factory
+	writeRTCP     func([]rtcp.Packet) error
 }
 
 // newRouter for routing rtp/rtcp packets
-func newRouter(id string, peer *webrtc.PeerConnection, session Session, config *WebRTCTransportConfig) Router {
+func newRouter(id string, session Session, config *WebRTCTransportConfig) Router {
 	ch := make(chan []rtcp.Packet, 10)
 	r := &router{
 		id:            id,
-		peer:          peer,
 		rtcpCh:        ch,
 		stopCh:        make(chan struct{}),
 		config:        config.Router,
@@ -64,7 +65,6 @@ func newRouter(id string, peer *webrtc.PeerConnection, session Session, config *
 		stats.Peers.Inc()
 	}
 
-	go r.sendRTCP()
 	return r
 }
 
@@ -185,13 +185,17 @@ func (r *router) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.TrackRe
 	return recv, publish
 }
 
-// AddWebRTCSender to Router
 func (r *router) AddDownTracks(s *Subscriber, recv Receiver) error {
 	r.Lock()
 	defer r.Unlock()
 
+	if s.noAutoSubscribe {
+		Logger.Info("peer turns off automatic subscription, skip tracks add")
+		return nil
+	}
+
 	if recv != nil {
-		if err := r.addDownTrack(s, recv); err != nil {
+		if _, err := r.AddDownTrack(s, recv); err != nil {
 			return err
 		}
 		s.negotiate()
@@ -200,7 +204,7 @@ func (r *router) AddDownTracks(s *Subscriber, recv Receiver) error {
 
 	if len(r.receivers) > 0 {
 		for _, rcv := range r.receivers {
-			if err := r.addDownTrack(s, rcv); err != nil {
+			if _, err := r.AddDownTrack(s, rcv); err != nil {
 				return err
 			}
 		}
@@ -209,16 +213,21 @@ func (r *router) AddDownTracks(s *Subscriber, recv Receiver) error {
 	return nil
 }
 
-func (r *router) addDownTrack(sub *Subscriber, recv Receiver) error {
+func (r *router) SetRTCPWriter(fn func(packet []rtcp.Packet) error) {
+	r.writeRTCP = fn
+	go r.sendRTCP()
+}
+
+func (r *router) AddDownTrack(sub *Subscriber, recv Receiver) (*DownTrack, error) {
 	for _, dt := range sub.GetDownTracks(recv.StreamID()) {
 		if dt.ID() == recv.TrackID() {
-			return nil
+			return dt, nil
 		}
 	}
 
 	codec := recv.Codec()
 	if err := sub.me.RegisterCodec(codec, recv.Kind()); err != nil {
-		return err
+		return nil, err
 	}
 
 	downTrack, err := NewDownTrack(webrtc.RTPCodecCapability{
@@ -229,13 +238,13 @@ func (r *router) addDownTrack(sub *Subscriber, recv Receiver) error {
 		RTCPFeedback: []webrtc.RTCPFeedback{{"goog-remb", ""}, {"nack", ""}, {"nack", "pli"}},
 	}, recv, r.bufferFactory, sub.id, r.config.MaxPacketTrack)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Create webrtc sender for the peer we are sending track to
 	if downTrack.transceiver, err = sub.pc.AddTransceiverFromTrack(downTrack, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionSendonly,
 	}); err != nil {
-		return err
+		return nil, err
 	}
 
 	// nolint:scopelint
@@ -259,7 +268,7 @@ func (r *router) addDownTrack(sub *Subscriber, recv Receiver) error {
 
 	sub.AddDownTrack(recv.StreamID(), downTrack)
 	recv.AddDownTrack(downTrack, r.config.Simulcast.BestQualityFirst)
-	return nil
+	return downTrack, nil
 }
 
 func (r *router) deleteReceiver(track string, ssrc uint32) {
@@ -273,7 +282,7 @@ func (r *router) sendRTCP() {
 	for {
 		select {
 		case pkts := <-r.rtcpCh:
-			if err := r.peer.WriteRTCP(pkts); err != nil {
+			if err := r.writeRTCP(pkts); err != nil {
 				Logger.Error(err, "Write rtcp to peer err", "peer_id", r.id)
 			}
 		case <-r.stopCh:

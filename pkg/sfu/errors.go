@@ -14,5 +14,5 @@ var (
 
 	ErrSpatialNotSupported  = errors.New("current track does not support simulcast/SVC")
 	ErrSpatialLayerNotFound = errors.New("the requested layer does not exist")
-	ErrSpatialLayerBusy     = errors.New("a spatial layer change is in progress, try latter")
+	ErrSpatialLayerBusy     = errors.New("a spatial layer change is in progress, try later")
 )

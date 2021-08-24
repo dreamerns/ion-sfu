@@ -26,6 +26,8 @@ type Subscriber struct {
 
 	negotiate func()
 	closeOnce sync.Once
+
+	noAutoSubscribe bool
 }
 
 // NewSubscriber creates a new Subscriber
@@ -44,11 +46,12 @@ func NewSubscriber(id string, cfg WebRTCTransportConfig) (*Subscriber, error) {
 	}
 
 	s := &Subscriber{
-		id:       id,
-		me:       me,
-		pc:       pc,
-		tracks:   make(map[string][]*DownTrack),
-		channels: make(map[string]*webrtc.DataChannel),
+		id:              id,
+		me:              me,
+		pc:              pc,
+		tracks:          make(map[string][]*DownTrack),
+		channels:        make(map[string]*webrtc.DataChannel),
+		noAutoSubscribe: false,
 	}
 
 	pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
@@ -215,6 +218,16 @@ func (s *Subscriber) GetDatachannel(label string) *webrtc.DataChannel {
 	return s.DataChannel(label)
 }
 
+func (s *Subscriber) DownTracks() []*DownTrack {
+	s.RLock()
+	defer s.RUnlock()
+	var downTracks []*DownTrack
+	for _, tracks := range s.tracks {
+		downTracks = append(downTracks, tracks...)
+	}
+	return downTracks
+}
+
 func (s *Subscriber) GetDownTracks(streamID string) []*DownTrack {
 	s.RLock()
 	defer s.RUnlock()
@@ -247,7 +260,9 @@ func (s *Subscriber) downTracksReports() {
 				if !dt.bound.get() {
 					continue
 				}
-				r = append(r, dt.CreateSenderReport())
+				if sr := dt.CreateSenderReport(); sr != nil {
+					r = append(r, sr)
+				}
 				sd = append(sd, dt.CreateSourceDescriptionChunks()...)
 			}
 		}

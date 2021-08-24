@@ -8,31 +8,42 @@ import (
 	"time"
 
 	"github.com/pion/rtcp"
+	"github.com/pion/transport/packetio"
 	"github.com/pion/webrtc/v3"
 
+	"github.com/pion/ion-sfu/pkg/buffer"
 	"github.com/pion/ion-sfu/pkg/relay"
 )
 
 type Publisher struct {
-	mu  sync.Mutex
+	mu  sync.RWMutex
 	id  string
 	pc  *webrtc.PeerConnection
 	cfg *WebRTCTransportConfig
 
 	router     Router
 	session    Session
-	tracks     []publisherTracks
-	relayPeer  []*relay.Peer
+	tracks     []PublisherTrack
+	relayed    atomicBool
+	relayPeers []*relayPeer
 	candidates []webrtc.ICECandidateInit
 
 	onICEConnectionStateChangeHandler atomic.Value // func(webrtc.ICEConnectionState)
+	onPublisherTrack                  atomic.Value // func(PublisherTrack)
 
 	closeOnce sync.Once
 }
 
-type publisherTracks struct {
-	track    *webrtc.TrackRemote
-	receiver Receiver
+type relayPeer struct {
+	peer                    *relay.Peer
+	dcs                     []*webrtc.DataChannel
+	withSRReports           bool
+	relayFanOutDataChannels bool
+}
+
+type PublisherTrack struct {
+	Track    *webrtc.TrackRemote
+	Receiver Receiver
 	// This will be used in the future for tracks that will be relayed as clients or servers
 	// This is for SVC and Simulcast where you will be able to chose if the relayed peer just
 	// want a single track (for recording/ processing) or get all the tracks (for load balancing)
@@ -59,7 +70,7 @@ func NewPublisher(id string, session Session, cfg *WebRTCTransportConfig) (*Publ
 		id:      id,
 		pc:      pc,
 		cfg:     cfg,
-		router:  newRouter(id, pc, session, cfg),
+		router:  newRouter(id, session, cfg),
 		session: session,
 	}
 
@@ -76,16 +87,20 @@ func NewPublisher(id string, session Session, cfg *WebRTCTransportConfig) (*Publ
 		if pub {
 			p.session.Publish(p.router, r)
 			p.mu.Lock()
-			p.tracks = append(p.tracks, publisherTracks{track, r, true})
-			for _, rp := range p.relayPeer {
-				if err = p.createRelayTrack(track, r, rp); err != nil {
+			publisherTrack := PublisherTrack{track, r, true}
+			p.tracks = append(p.tracks, publisherTrack)
+			for _, rp := range p.relayPeers {
+				if err = p.createRelayTrack(track, r, rp.peer); err != nil {
 					Logger.V(1).Error(err, "Creating relay track.", "peer_id", p.id)
 				}
 			}
 			p.mu.Unlock()
+			if handler, ok := p.onPublisherTrack.Load().(func(PublisherTrack)); ok && handler != nil {
+				handler(publisherTrack)
+			}
 		} else {
 			p.mu.Lock()
-			p.tracks = append(p.tracks, publisherTracks{track, r, false})
+			p.tracks = append(p.tracks, PublisherTrack{track, r, false})
 			p.mu.Unlock()
 		}
 	})
@@ -112,6 +127,8 @@ func NewPublisher(id string, session Session, cfg *WebRTCTransportConfig) (*Publ
 			handler(connectionState)
 		}
 	})
+
+	p.router.SetRTCPWriter(p.pc.WriteRTCP)
 
 	return p, nil
 }
@@ -146,10 +163,10 @@ func (p *Publisher) GetRouter() Router {
 // Close peer
 func (p *Publisher) Close() {
 	p.closeOnce.Do(func() {
-		if len(p.relayPeer) > 0 {
+		if len(p.relayPeers) > 0 {
 			p.mu.Lock()
-			for _, rp := range p.relayPeer {
-				if err := rp.Close(); err != nil {
+			for _, rp := range p.relayPeers {
+				if err := rp.peer.Close(); err != nil {
 					Logger.Error(err, "Closing relay peer transport.")
 				}
 			}
@@ -160,6 +177,10 @@ func (p *Publisher) Close() {
 			Logger.Error(err, "webrtc transport close err")
 		}
 	})
+}
+
+func (p *Publisher) OnPublisherTrack(f func(track PublisherTrack)) {
+	p.onPublisherTrack.Store(f)
 }
 
 // OnICECandidate handler
@@ -179,23 +200,54 @@ func (p *Publisher) PeerConnection() *webrtc.PeerConnection {
 	return p.pc
 }
 
-func (p *Publisher) Relay(ice []webrtc.ICEServer) (*relay.Peer, error) {
+// Relay will relay all current and future tracks from current Publisher
+func (p *Publisher) Relay(signalFn func(meta relay.PeerMeta, signal []byte) ([]byte, error),
+	options ...func(r *relayPeer)) (*relay.Peer, error) {
+	lrp := &relayPeer{}
+	for _, o := range options {
+		o(lrp)
+	}
+
 	rp, err := relay.NewPeer(relay.PeerMeta{
 		PeerID:    p.id,
 		SessionID: p.session.ID(),
 	}, &relay.PeerConfig{
 		SettingEngine: p.cfg.Setting,
-		ICEServers:    ice,
+		ICEServers:    p.cfg.Configuration.ICEServers,
 		Logger:        Logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("relay: %w", err)
 	}
+	lrp.peer = rp
 
 	rp.OnReady(func() {
-		for _, lbl := range p.session.GetDataChannelLabels() {
-			if _, err := rp.CreateDataChannel(lbl); err != nil {
-				Logger.V(1).Error(err, "Creating data channels.", "peer_id", p.id)
+		peer := p.session.GetPeer(p.id)
+
+		p.relayed.set(true)
+		if lrp.relayFanOutDataChannels {
+			for _, lbl := range p.session.GetFanOutDataChannelLabels() {
+				lbl := lbl
+				dc, err := rp.CreateDataChannel(lbl)
+				if err != nil {
+					Logger.V(1).Error(err, "Creating data channels.", "peer_id", p.id)
+				}
+				dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+					if peer == nil || peer.Subscriber() == nil {
+						return
+					}
+					if sdc := peer.Subscriber().DataChannel(lbl); sdc != nil {
+						if msg.IsString {
+							if err = sdc.SendText(string(msg.Data)); err != nil {
+								Logger.Error(err, "Sending dc message err")
+							}
+						} else {
+							if err = sdc.Send(msg.Data); err != nil {
+								Logger.Error(err, "Sending dc message err")
+							}
+						}
+					}
+				})
 			}
 		}
 
@@ -205,29 +257,99 @@ func (p *Publisher) Relay(ice []webrtc.ICEServer) (*relay.Peer, error) {
 				// simulcast will just relay client track for now
 				continue
 			}
-			if err = p.createRelayTrack(tp.track, tp.receiver, rp); err != nil {
+			if err = p.createRelayTrack(tp.Track, tp.Receiver, rp); err != nil {
 				Logger.V(1).Error(err, "Creating relay track.", "peer_id", p.id)
 			}
 		}
-		p.relayPeer = append(p.relayPeer, rp)
+		p.relayPeers = append(p.relayPeers, lrp)
 		p.mu.Unlock()
-		go p.relayReports(rp)
+
+		if lrp.withSRReports {
+			go p.relayReports(rp)
+		}
 	})
 
-	if err = rp.Offer(p.cfg.Relay); err != nil {
+	rp.OnDataChannel(func(channel *webrtc.DataChannel) {
+		if !lrp.relayFanOutDataChannels {
+			return
+		}
+		p.mu.Lock()
+		lrp.dcs = append(lrp.dcs, channel)
+		p.mu.Unlock()
+
+		p.session.AddDatachannel("", channel)
+	})
+
+	if err = rp.Offer(signalFn); err != nil {
 		return nil, fmt.Errorf("relay: %w", err)
 	}
 
 	return rp, nil
 }
 
-func (p *Publisher) Tracks() []*webrtc.TrackRemote {
+func (p *Publisher) PublisherTracks() []PublisherTrack {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	tracks := make([]PublisherTrack, len(p.tracks))
+	for idx, track := range p.tracks {
+		tracks[idx] = track
+	}
+	return tracks
+}
+
+// AddRelayFanOutDataChannel adds fan out data channel to relayed peers
+func (p *Publisher) AddRelayFanOutDataChannel(label string) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	for _, rp := range p.relayPeers {
+		for _, dc := range rp.dcs {
+			if dc.Label() == label {
+				continue
+			}
+		}
+
+		dc, err := rp.peer.CreateDataChannel(label)
+		if err != nil {
+			Logger.V(1).Error(err, "Creating data channels.", "peer_id", p.id)
+		}
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			p.session.FanOutMessage("", label, msg)
+		})
+	}
+}
+
+// GetRelayedDataChannels Returns a slice of data channels that belongs to relayed
+// peers
+func (p *Publisher) GetRelayedDataChannels(label string) []*webrtc.DataChannel {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	dcs := make([]*webrtc.DataChannel, 0, len(p.relayPeers))
+	for _, rp := range p.relayPeers {
+		for _, dc := range rp.dcs {
+			if dc.Label() == label {
+				dcs = append(dcs, dc)
+				break
+			}
+		}
+	}
+	return dcs
+}
+
+// Relayed returns true if the publisher has been relayed at least once
+func (p *Publisher) Relayed() bool {
+	return p.relayed.get()
+}
+
+func (p *Publisher) Tracks() []*webrtc.TrackRemote {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	tracks := make([]*webrtc.TrackRemote, len(p.tracks))
 	for idx, track := range p.tracks {
-		tracks[idx] = track.track
+		tracks[idx] = track.Track
 	}
 	return tracks
 }
@@ -261,6 +383,32 @@ func (p *Publisher) createRelayTrack(track *webrtc.TrackRemote, receiver Receive
 		return fmt.Errorf("relay: %w", err)
 	}
 
+	p.cfg.BufferFactory.GetOrNew(packetio.RTCPBufferPacket,
+		uint32(sdr.GetParameters().Encodings[0].SSRC)).(*buffer.RTCPReader).OnPacket(func(bytes []byte) {
+		pkts, err := rtcp.Unmarshal(bytes)
+		if err != nil {
+			Logger.V(1).Error(err, "Unmarshal rtcp reports", "peer_id", p.id)
+			return
+		}
+		var rpkts []rtcp.Packet
+		for _, pkt := range pkts {
+			switch pk := pkt.(type) {
+			case *rtcp.PictureLossIndication:
+				rpkts = append(rpkts, &rtcp.PictureLossIndication{
+					SenderSSRC: pk.MediaSSRC,
+					MediaSSRC:  uint32(track.SSRC()),
+				})
+			}
+		}
+
+		if len(rpkts) > 0 {
+			if err := p.pc.WriteRTCP(rpkts); err != nil {
+				Logger.V(1).Error(err, "Sending rtcp relay reports", "peer_id", p.id)
+			}
+		}
+
+	})
+
 	downTrack.OnCloseHandler(func() {
 		if err = sdr.Stop(); err != nil {
 			Logger.V(1).Error(err, "Stopping relay sender.", "peer_id", p.id)
@@ -281,7 +429,9 @@ func (p *Publisher) relayReports(rp *relay.Peer) {
 				if !dt.bound.get() {
 					continue
 				}
-				r = append(r, dt.CreateSenderReport())
+				if sr := dt.CreateSenderReport(); sr != nil {
+					r = append(r, sr)
+				}
 			}
 		}
 

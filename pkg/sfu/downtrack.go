@@ -13,7 +13,7 @@ import (
 	"github.com/pion/ion-sfu/pkg/buffer"
 )
 
-// DownTrackType determines the type of a track
+// DownTrackType determines the type of track
 type DownTrackType int
 
 const (
@@ -25,7 +25,6 @@ const (
 // to SFU Subscriber, the track handle the packets for simple, simulcast
 // and SVC Publisher.
 type DownTrack struct {
-	mu            sync.RWMutex
 	id            string
 	peerID        string
 	bound         atomicBool
@@ -37,7 +36,7 @@ type DownTrack struct {
 	sequencer     *sequencer
 	trackType     DownTrackType
 	bufferFactory *buffer.Factory
-	payload       []byte
+	payload       *[]byte
 
 	currentSpatialLayer atomicInt32
 	targetSpatialLayer  atomicInt32
@@ -99,8 +98,8 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 		d.payloadType = uint8(codec.PayloadType)
 		d.writeStream = t.WriteStream()
 		d.mime = strings.ToLower(codec.MimeType)
-		d.enabled.set(true)
 		d.reSync.set(true)
+		d.enabled.set(true)
 		if rr := d.bufferFactory.GetOrNew(packetio.RTCPBufferPacket, uint32(t.SSRC())).(*buffer.RTCPReader); rr != nil {
 			rr.OnPacket(func(pkt []byte) {
 				d.handleRTCP(pkt)
@@ -149,12 +148,19 @@ func (d *DownTrack) Kind() webrtc.RTPCodecType {
 	}
 }
 
+func (d *DownTrack) Stop() error {
+	if d.transceiver != nil {
+		return d.transceiver.Stop()
+	}
+	return fmt.Errorf("d.transceiver not exists")
+}
+
 func (d *DownTrack) SetTransceiver(transceiver *webrtc.RTPTransceiver) {
 	d.transceiver = transceiver
 }
 
 // WriteRTP writes a RTP Packet to the DownTrack
-func (d *DownTrack) WriteRTP(p *buffer.ExtPacket) error {
+func (d *DownTrack) WriteRTP(p *buffer.ExtPacket, layer int32) error {
 	d.lastRTP.set(time.Now().UnixNano())
 
 	if !d.bound.get() {
@@ -169,9 +175,13 @@ func (d *DownTrack) WriteRTP(p *buffer.ExtPacket) error {
 	case SimpleDownTrack:
 		return d.writeSimpleRTP(p)
 	case SimulcastDownTrack:
-		return d.writeSimulcastRTP(p)
+		return d.writeSimulcastRTP(p, layer)
 	}
 	return nil
+}
+
+func (d *DownTrack) Enabled() bool {
+	return d.enabled.get()
 }
 
 // Mute enables or disables media forwarding
@@ -221,7 +231,6 @@ func (d *DownTrack) SwitchSpatialLayer(targetLayer int32, setAsMax bool) error {
 	if !d.receiver.HasSpatialLayer(targetLayer) {
 		return ErrSpatialLayerNotFound
 	}
-
 	// already set
 	if d.CurrentSpatialLayer() == targetLayer {
 		return nil
@@ -234,8 +243,8 @@ func (d *DownTrack) SwitchSpatialLayer(targetLayer int32, setAsMax bool) error {
 	return nil
 }
 
-func (d *DownTrack) SwitchSpatialLayerDone(targetLayer int32) {
-	d.currentSpatialLayer.set(targetLayer)
+func (d *DownTrack) SwitchSpatialLayerDone(layer int32) {
+	d.currentSpatialLayer.set(layer)
 }
 
 func (d *DownTrack) UptrackLayersChange(availableLayers []uint16) (int32, error) {
@@ -325,13 +334,24 @@ func (d *DownTrack) CreateSenderReport() *rtcp.SenderReport {
 	if !d.bound.get() {
 		return nil
 	}
-	now := time.Now().UnixNano()
-	maxPktTs := d.lastTS.get()
-	diffTs := uint32((now/1e6)-d.lastPacketMs.get()) * d.codec.ClockRate / 1000
+
+	srRTP, srNTP := d.receiver.GetSenderReportTime(d.CurrentSpatialLayer())
+	if srRTP == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	nowNTP := toNtpTime(now)
+
+	diff := (uint64(now.Sub(ntpTime(srNTP).Time())) * uint64(d.codec.ClockRate)) / uint64(time.Second)
+	if diff < 0 {
+		diff = 0
+	}
+
 	return &rtcp.SenderReport{
 		SSRC:        d.ssrc,
-		NTPTime:     timeToNtp(now),
-		RTPTime:     maxPktTs + diffTs,
+		NTPTime:     uint64(nowNTP),
+		RTPTime:     srRTP + uint32(diff),
 		PacketCount: d.packetCount.get(),
 		OctetCount:  d.octetCount.get(),
 	}
@@ -354,9 +374,10 @@ func (d *DownTrack) writeSimpleRTP(extPkt *buffer.ExtPacket) error {
 				return nil
 			}
 		}
-
-		d.snOffset.set(extPkt.Packet.SequenceNumber - d.lastSN.get() - 1)
-		d.tsOffset.set(extPkt.Packet.Timestamp - d.lastTS.get() - 1)
+		if d.lastSN != 0 {
+			d.snOffset.set(extPkt.Packet.SequenceNumber - d.lastSN.get() - 1)
+			d.tsOffset.set(extPkt.Packet.Timestamp - d.lastTS.get() - 1)
+		}
 		d.lastSSRC.set(extPkt.Packet.SSRC)
 		d.reSync.set(false)
 	}
@@ -369,11 +390,9 @@ func (d *DownTrack) writeSimpleRTP(extPkt *buffer.ExtPacket) error {
 	if d.sequencer != nil {
 		d.sequencer.push(extPkt.Packet.SequenceNumber, newSN, newTS, 0, extPkt.Head)
 	}
-
-	if lastSN := d.lastSN.get(); (newSN-lastSN)&0x8000 == 0 || lastSN == 0 {
+	if extPkt.Head {
 		d.lastSN.set(newSN)
 		d.lastTS.set(newTS)
-		d.lastPacketMs.set(extPkt.Arrival / 1e6)
 	}
 
 	hdr := extPkt.Packet.Header
@@ -383,16 +402,19 @@ func (d *DownTrack) writeSimpleRTP(extPkt *buffer.ExtPacket) error {
 	hdr.SSRC = d.ssrc
 
 	_, err := d.writeStream.WriteRTP(&hdr, extPkt.Packet.Payload)
-	if err != nil {
-		Logger.Error(err, "Write packet err")
-	}
 	return err
 }
 
-func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket) error {
+func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket, layer int32) error {
 	// Check if packet SSRC is different from before
 	// if true, the video source changed
 	reSync := d.reSync.get()
+	csl := d.CurrentSpatialLayer()
+
+	if csl != layer {
+		return nil
+	}
+
 	lastSSRC := d.lastSSRC.get()
 	if lastSSRC != extPkt.Packet.SSRC || reSync {
 		// Wait for a keyframe to sync new source
@@ -454,18 +476,16 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket) error {
 	if d.simulcast.temporalSupported {
 		if d.mime == "video/vp8" {
 			drop := false
-			if picID, tlz0Idx, drop = setVP8TemporalLayer(extPkt, d); drop {
+			if payload, picID, tlz0Idx, drop = setVP8TemporalLayer(extPkt, d); drop {
 				// Pkt not in temporal getLayer update sequence number offset to avoid gaps
 				d.snOffset.add(1)
 				return nil
 			}
-			payload = d.payload
 		}
 	}
 
 	if d.sequencer != nil {
-		layer := d.CurrentSpatialLayer()
-		if meta := d.sequencer.push(extPkt.Packet.SequenceNumber, newSN, newTS, uint8(layer), extPkt.Head); meta != nil &&
+		if meta := d.sequencer.push(extPkt.Packet.SequenceNumber, newSN, newTS, uint8(csl), extPkt.Head); meta != nil &&
 			d.simulcast.temporalSupported && d.mime == "video/vp8" {
 			meta.setVP8PayloadMeta(tlz0Idx, picID)
 		}
@@ -489,10 +509,6 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket) error {
 	hdr.PayloadType = d.payloadType
 
 	_, err := d.writeStream.WriteRTP(&hdr, payload)
-	if err != nil {
-		Logger.Error(err, "Write packet err")
-	}
-
 	return err
 }
 
