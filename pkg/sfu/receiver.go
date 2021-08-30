@@ -362,7 +362,7 @@ func (w *WebRTCReceiver) GetMaxTemporalLayer() [3]int32 {
 	defer w.bufferMu.RUnlock()
 	for i, buff := range w.buffers {
 		if buff != nil {
-			tls[i] = int32(buff.MaxTemporalLayer())
+			tls[i] = buff.MaxTemporalLayer()
 		}
 	}
 	return tls
@@ -411,7 +411,9 @@ func (w *WebRTCReceiver) SetRTCPCh(ch chan []rtcp.Packet) {
 func (w *WebRTCReceiver) GetSenderReportTime(layer int32) (rtpTS uint32, ntpTS uint64) {
 	w.bufferMu.RLock()
 	defer w.bufferMu.RUnlock()
-	rtpTS, ntpTS, _ = w.buffers[layer].GetSenderReportData()
+	if w.buffers[layer] != nil {
+		rtpTS, ntpTS, _ = w.buffers[layer].GetSenderReportData()
+	}
 	return
 }
 
