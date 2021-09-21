@@ -63,10 +63,8 @@ type DownTrack struct {
 	closeOnce      sync.Once
 
 	// Report helpers
-	octetCount   atomicUint32
-	packetCount  atomicUint32
-	maxPacketTs  atomicUint32
-	lastPacketMs atomicInt64
+	octetCount  atomicUint32
+	packetCount atomicUint32
 
 	// Debug info
 	lastPli     atomicInt64
@@ -496,7 +494,6 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket, layer int32) err
 	if extPkt.Head {
 		d.lastSN.set(newSN)
 		d.lastTS.set(newTS)
-		d.lastPacketMs.set(time.Now().UnixNano() / 1e6)
 	}
 
 	// Update base
