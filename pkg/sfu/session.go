@@ -5,14 +5,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/webrtc/v3"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/pion/ion-sfu/pkg/logger"
 	"github.com/pion/ion-sfu/pkg/relay"
-
-	"github.com/pion/webrtc/v3"
 )
 
 // Session represents a set of peers. Transports inside a SessionLocal
@@ -164,6 +163,7 @@ func (s *SessionLocal) AddDatachannel(owner string, dc *webrtc.DataChannel) {
 	s.mu.Lock()
 	for _, lbl := range s.fanOutDCs {
 		if label == lbl {
+			s.mu.Unlock()
 			return
 		}
 	}

@@ -71,6 +71,8 @@ type DownTrack struct {
 	lastRTP     atomicInt64
 	pktsMuted   atomicUint32
 	pktsDropped atomicUint32
+
+	maxPacketTs uint32
 }
 
 // NewDownTrack returns a DownTrack.
@@ -345,13 +347,14 @@ func (d *DownTrack) CreateSenderReport() *rtcp.SenderReport {
 	if diff < 0 {
 		diff = 0
 	}
+	octets, packets := d.getSRStats()
 
 	return &rtcp.SenderReport{
 		SSRC:        d.ssrc,
 		NTPTime:     uint64(nowNTP),
 		RTPTime:     srRTP + uint32(diff),
-		PacketCount: d.packetCount.get(),
-		OctetCount:  d.octetCount.get(),
+		PacketCount: packets,
+		OctetCount:  octets,
 	}
 }
 
@@ -622,6 +625,10 @@ func (d *DownTrack) handleLayerChange(maxRatePacketLoss uint8, expectedMinBitrat
 			}
 		}
 	}
+}
+
+func (d *DownTrack) getSRStats() (octets, packets uint32) {
+	return d.octetCount.get(), d.packetCount.get()
 }
 
 func (d *DownTrack) DebugInfo() map[string]interface{} {

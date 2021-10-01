@@ -7,12 +7,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/ion-sfu/pkg/buffer"
+	"github.com/pion/ion-sfu/pkg/relay"
 	"github.com/pion/rtcp"
 	"github.com/pion/transport/packetio"
 	"github.com/pion/webrtc/v3"
-
-	"github.com/pion/ion-sfu/pkg/buffer"
-	"github.com/pion/ion-sfu/pkg/relay"
 )
 
 type Publisher struct {
@@ -83,7 +82,7 @@ func NewPublisher(id string, session Session, cfg *WebRTCTransportConfig) (*Publ
 			"stream_id", track.StreamID(),
 		)
 
-		r, pub := p.router.AddReceiver(receiver, track)
+		r, pub := p.router.AddReceiver(receiver, track, track.ID(), track.StreamID())
 		if pub {
 			p.session.Publish(p.router, r)
 			p.mu.Lock()
