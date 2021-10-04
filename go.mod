@@ -15,12 +15,12 @@ require (
 	github.com/pion/dtls/v2 v2.0.9
 	github.com/pion/ice/v2 v2.1.12
 	github.com/pion/logging v0.2.2
-	github.com/pion/rtcp v1.2.7
+	github.com/pion/rtcp v1.2.8
 	github.com/pion/rtp v1.7.2
 	github.com/pion/sdp/v3 v3.0.4
 	github.com/pion/transport v0.12.3
 	github.com/pion/turn/v2 v2.0.5
-	github.com/pion/webrtc/v3 v3.1.0-beta.8
+	github.com/pion/webrtc/v3 v3.1.1
 	github.com/prometheus/client_golang v1.9.0
 	github.com/rs/cors v1.7.0 // indirect
 	github.com/rs/zerolog v1.23.0
