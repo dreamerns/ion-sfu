@@ -83,8 +83,9 @@ type Buffer struct {
 
 	stats Stats
 
-	latestTimestamp     uint32 // latest received RTP timestamp on packet
-	latestTimestampTime int64  // Time of the latest timestamp (in nanos since unix epoch)
+	latestTimestamp          uint32 // latest received RTP timestamp on packet
+	latestTimestampTime      int64  // Time of the latest timestamp (in nanos since unix epoch)
+	lastFractionLostToReport uint8  // Last fractionlost from subscribers, should report to publisher; Audio only
 
 	// callbacks
 	onClose      func()
@@ -469,6 +470,11 @@ func (b *Buffer) buildReceptionReport() rtcp.ReceptionReport {
 	if expectedInterval != 0 && lostInterval > 0 {
 		fracLost = uint8((lostInterval << 8) / expectedInterval)
 	}
+	if b.lastFractionLostToReport > fracLost {
+		// If fractionlost from subscriber is bigger than sfu received, use it.
+		fracLost = b.lastFractionLostToReport
+	}
+
 	var dlsr uint32
 
 	if b.lastSRRecv != 0 {
@@ -495,6 +501,10 @@ func (b *Buffer) SetSenderReportData(rtpTime uint32, ntpTime uint64) {
 	b.lastSRNTPTime = ntpTime
 	b.lastSRRecv = time.Now().UnixNano()
 	b.Unlock()
+}
+
+func (b *Buffer) SetLastFractionLostReport(lost uint8) {
+	b.lastFractionLostToReport = lost
 }
 
 func (b *Buffer) getRTCP() []rtcp.Packet {

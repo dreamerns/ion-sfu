@@ -579,6 +579,11 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 	if len(fwdPkts) > 0 {
 		d.receiver.SendRTCP(fwdPkts)
 	}
+
+	// only forward audio track's fractionlost to publiser
+	if d.Kind() == webrtc.RTPCodecTypeAudio {
+		d.receiver.HandleDownTrackFractionLost(maxRatePacketLoss)
+	}
 }
 
 func (d *DownTrack) handleLayerChange(maxRatePacketLoss uint8, expectedMinBitrate uint64) {

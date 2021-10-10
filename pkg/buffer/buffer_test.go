@@ -3,6 +3,7 @@ package buffer
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pion/ion-sfu/pkg/logger"
 	"github.com/pion/rtcp"
@@ -181,4 +182,58 @@ func TestNewBuffer(t *testing.T) {
 			assert.Equal(t, uint16(2), buff.maxSeqNo)
 		})
 	}
+}
+
+func TestFractionLostReport(t *testing.T) {
+	pool := &sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 1500)
+			return &b
+		},
+	}
+	logger.SetGlobalOptions(logger.GlobalConfig{V: 1}) // 2 - TRACE
+	logger := logger.New()
+	buff := NewBuffer(123, pool, pool, logger)
+	buff.codecType = webrtc.RTPCodecTypeVideo
+	assert.NotNil(t, buff)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	buff.SetLastFractionLostReport(55)
+	buff.OnFeedback(func(fb []rtcp.Packet) {
+		for _, pkt := range fb {
+			switch p := pkt.(type) {
+			case *rtcp.ReceiverReport:
+				for _, v := range p.Reports {
+					assert.EqualValues(t, 55, v.FractionLost)
+				}
+				wg.Done()
+			}
+		}
+	})
+	buff.Bind(webrtc.RTPParameters{
+		HeaderExtensions: nil,
+		Codecs: []webrtc.RTPCodecParameters{
+			{
+				RTPCodecCapability: webrtc.RTPCodecCapability{
+					MimeType:  "audio/opus",
+					ClockRate: 48000,
+				},
+				PayloadType: 96,
+			},
+		},
+	}, Options{})
+	for i := 0; i < 15; i++ {
+		pkt := rtp.Packet{
+			Header:  rtp.Header{SequenceNumber: uint16(i), Timestamp: uint32(i)},
+			Payload: []byte{0xff, 0xff, 0xff, 0xfd, 0xb4, 0x9f, 0x94, 0x1},
+		}
+		b, err := pkt.Marshal()
+		assert.NoError(t, err)
+		if i == 1 {
+			time.Sleep(1 * time.Second)
+		}
+		_, err = buff.Write(b)
+		assert.NoError(t, err)
+	}
+	wg.Wait()
 }
