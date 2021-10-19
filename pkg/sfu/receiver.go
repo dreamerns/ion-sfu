@@ -469,6 +469,12 @@ func (w *WebRTCReceiver) RetransmitPackets(track *DownTrack, packets []packetMet
 				}
 			}
 
+			err = track.WriteRTPHeaderExtensions(&pkt.Header)
+			if err != nil {
+				Logger.Error(err, "Writing rtp header extensions err")
+				continue
+			}
+
 			if _, err = track.writeStream.WriteRTP(&pkt.Header, pkt.Payload); err != nil {
 				Logger.Error(err, "Writing rtx packet err")
 			} else {

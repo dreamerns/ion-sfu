@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/transport/packetio"
 	"github.com/pion/webrtc/v3"
 
@@ -54,13 +56,14 @@ type DownTrack struct {
 	maxSpatialLayer  atomicInt32
 	maxTemporalLayer atomicInt32
 
-	codec          webrtc.RTPCodecCapability
-	receiver       Receiver
-	transceiver    *webrtc.RTPTransceiver
-	writeStream    webrtc.TrackLocalWriter
-	onCloseHandler func()
-	onBind         func()
-	closeOnce      sync.Once
+	codec               webrtc.RTPCodecCapability
+	rtpHeaderExtensions []webrtc.RTPHeaderExtensionParameter
+	receiver            Receiver
+	transceiver         *webrtc.RTPTransceiver
+	writeStream         webrtc.TrackLocalWriter
+	onCloseHandler      func()
+	onBind              func()
+	closeOnce           sync.Once
 
 	// Report helpers
 	octetCount  atomicUint32
@@ -136,6 +139,11 @@ func (d *DownTrack) Codec() webrtc.RTPCodecCapability { return d.codec }
 // StreamID is the group this track belongs too. This must be unique
 func (d *DownTrack) StreamID() string { return d.streamID }
 
+// Sets RTP header extensions for this track
+func (d *DownTrack) SetRTPHeaderExtensions(rtpHeaderExtensions []webrtc.RTPHeaderExtensionParameter) {
+	d.rtpHeaderExtensions = rtpHeaderExtensions
+}
+
 // Kind controls if this TrackLocal is audio or video
 func (d *DownTrack) Kind() webrtc.RTPCodecType {
 	switch {
@@ -157,6 +165,34 @@ func (d *DownTrack) Stop() error {
 
 func (d *DownTrack) SetTransceiver(transceiver *webrtc.RTPTransceiver) {
 	d.transceiver = transceiver
+}
+
+// Writes RTP header extensions of track
+func (d *DownTrack) WriteRTPHeaderExtensions(hdr *rtp.Header) error {
+	// clear out extensions that may have been in the forwarded header
+	hdr.Extension = false
+	hdr.ExtensionProfile = 0
+	hdr.Extensions = []rtp.Extension{}
+
+	for _, ext := range d.rtpHeaderExtensions {
+		if ext.URI != sdp.ABSSendTimeURI {
+			// supporting only abs-send-time
+			continue
+		}
+
+		sendTime := rtp.NewAbsSendTimeExtension(time.Now())
+		b, err := sendTime.Marshal()
+		if err != nil {
+			return err
+		}
+
+		err = hdr.SetExtension(uint8(ext.ID), b)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // WriteRTP writes a RTP Packet to the DownTrack
@@ -402,7 +438,12 @@ func (d *DownTrack) writeSimpleRTP(extPkt *buffer.ExtPacket) error {
 	hdr.SequenceNumber = newSN
 	hdr.SSRC = d.ssrc
 
-	_, err := d.writeStream.WriteRTP(&hdr, extPkt.Packet.Payload)
+	err := d.WriteRTPHeaderExtensions(&hdr)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.writeStream.WriteRTP(&hdr, extPkt.Packet.Payload)
 	return err
 }
 
@@ -508,7 +549,12 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket, layer int32) err
 	hdr.SSRC = d.ssrc
 	hdr.PayloadType = d.payloadType
 
-	_, err := d.writeStream.WriteRTP(&hdr, payload)
+	err := d.WriteRTPHeaderExtensions(&hdr)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.writeStream.WriteRTP(&hdr, payload)
 	return err
 }
 
