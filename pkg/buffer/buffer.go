@@ -316,6 +316,14 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		return
 	}
 
+	// submit to TWCC even if it is a padding only packet. Clients use padding only packets as probes
+	// for bandwidth estimation
+	if b.twcc {
+		if ext := p.GetExtension(b.twccExt); ext != nil && len(ext) > 1 {
+			b.feedbackTWCC(binary.BigEndian.Uint16(ext[0:2]), arrivalTime, p.Marker)
+		}
+	}
+
 	b.stats.TotalByte += uint64(len(pkt))
 	b.bitrateHelper += uint64(len(pkt))
 	b.stats.PacketCount++
@@ -375,12 +383,6 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		b.stats.Jitter += (float64(d) - b.stats.Jitter) / 16
 	}
 	b.lastTransit = transit
-
-	if b.twcc {
-		if ext := p.GetExtension(b.twccExt); ext != nil && len(ext) > 1 {
-			b.feedbackTWCC(binary.BigEndian.Uint16(ext[0:2]), arrivalTime, p.Marker)
-		}
-	}
 
 	if b.audioLevel {
 		if e := p.GetExtension(b.audioExt); e != nil && b.onAudioLevel != nil {
