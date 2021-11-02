@@ -37,8 +37,6 @@ type Receiver interface {
 	OnCloseHandler(fn func())
 	SendRTCP(p []rtcp.Packet)
 	SetRTCPCh(ch chan []rtcp.Packet)
-	OnFractionLostFB(fn func(uint8))
-	HandleDownTrackFractionLost(lost uint8)
 
 	GetSenderReportTime(layer int32) (rtpTS uint32, ntpTS uint64)
 	DebugInfo() map[string]interface{}
@@ -88,7 +86,6 @@ type WebRTCReceiver struct {
 	fracLostMu        sync.Mutex
 	maxDownFracLost   uint8
 	maxDownFracLostTs time.Time
-	onFractionLostFB  func(uint8)
 }
 
 type ReceiverOpts func(w *WebRTCReceiver) *WebRTCReceiver
@@ -637,31 +634,4 @@ func (w *WebRTCReceiver) DebugInfo() map[string]interface{} {
 	info["UpTracks"] = upTrackInfo
 
 	return info
-}
-
-func (w *WebRTCReceiver) HandleDownTrackFractionLost(lost uint8) {
-	var (
-		fb      bool
-		maxLost uint8
-	)
-	w.fracLostMu.Lock()
-	if w.maxDownFracLost < lost {
-		w.maxDownFracLost = lost
-	}
-	now := time.Now()
-	if now.Sub(w.maxDownFracLostTs).Nanoseconds() > lostUpdateDelta {
-		fb = true
-		maxLost = w.maxDownFracLost
-		w.maxDownFracLost = 0
-		w.maxDownFracLostTs = now
-	}
-	w.fracLostMu.Unlock()
-
-	if fb && w.onFractionLostFB != nil {
-		w.onFractionLostFB(maxLost)
-	}
-}
-
-func (w *WebRTCReceiver) OnFractionLostFB(fn func(uint8)) {
-	w.onFractionLostFB = fn
 }

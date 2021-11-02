@@ -192,8 +192,7 @@ func TestFractionLostReport(t *testing.T) {
 		},
 	}
 	logger.SetGlobalOptions(logger.GlobalConfig{V: 1}) // 2 - TRACE
-	logger := logger.New()
-	buff := NewBuffer(123, pool, pool, logger)
+	buff := NewBuffer(123, pool, pool, logger.New())
 	buff.codecType = webrtc.RTPCodecTypeVideo
 	assert.NotNil(t, buff)
 	var wg sync.WaitGroup

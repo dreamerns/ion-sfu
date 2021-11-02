@@ -23,6 +23,8 @@ const (
 	SimulcastDownTrack
 )
 
+type ReceiverReportListener func(dt *DownTrack, report *rtcp.ReceiverReport)
+
 // DownTrack  implements TrackLocal, is the track used to write packets
 // to SFU Subscriber, the track handle the packets for simple, simulcast
 // and SVC Publisher.
@@ -56,14 +58,16 @@ type DownTrack struct {
 	maxSpatialLayer  atomicInt32
 	maxTemporalLayer atomicInt32
 
-	codec               webrtc.RTPCodecCapability
-	rtpHeaderExtensions []webrtc.RTPHeaderExtensionParameter
-	receiver            Receiver
-	transceiver         *webrtc.RTPTransceiver
-	writeStream         webrtc.TrackLocalWriter
-	onCloseHandler      func()
-	onBind              func()
-	closeOnce           sync.Once
+	codec                   webrtc.RTPCodecCapability
+	rtpHeaderExtensions     []webrtc.RTPHeaderExtensionParameter
+	receiver                Receiver
+	transceiver             *webrtc.RTPTransceiver
+	writeStream             webrtc.TrackLocalWriter
+	onCloseHandler          func()
+	onBind                  func()
+	receiverReportListeners []ReceiverReportListener
+	listenerLock            sync.RWMutex
+	closeOnce               sync.Once
 
 	// Report helpers
 	octetCount  atomicUint32
@@ -345,6 +349,12 @@ func (d *DownTrack) OnBind(fn func()) {
 	d.onBind = fn
 }
 
+func (d *DownTrack) AddReceiverReportListener(listener func(*DownTrack, *rtcp.ReceiverReport)) {
+	d.listenerLock.Lock()
+	defer d.listenerLock.Unlock()
+	d.receiverReportListeners = append(d.receiverReportListeners, listener)
+}
+
 func (d *DownTrack) CreateSourceDescriptionChunks() []rtcp.SourceDescriptionChunk {
 	if !d.bound.get() {
 		return nil
@@ -581,6 +591,7 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 	if ssrc == 0 {
 		return
 	}
+
 	for _, pkt := range pkts {
 		switch p := pkt.(type) {
 		case *rtcp.PictureLossIndication:
@@ -603,10 +614,26 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 				expectedMinBitrate = uint64(p.Bitrate)
 			}
 		case *rtcp.ReceiverReport:
+			// create new receiver report w/ only valid reception reports
+			rr := &rtcp.ReceiverReport{
+				SSRC:              p.SSRC,
+				ProfileExtensions: p.ProfileExtensions,
+			}
 			for _, r := range p.Reports {
+				if r.SSRC != d.ssrc {
+					continue
+				}
+				rr.Reports = append(rr.Reports, r)
 				if maxRatePacketLoss == 0 || maxRatePacketLoss < r.FractionLost {
 					maxRatePacketLoss = r.FractionLost
 				}
+			}
+			if len(rr.Reports) > 0 {
+				d.listenerLock.RLock()
+				for _, l := range d.receiverReportListeners {
+					l(d, rr)
+				}
+				d.listenerLock.RUnlock()
 			}
 		case *rtcp.TransportLayerNack:
 			var nackedPackets []packetMeta
@@ -624,11 +651,6 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 
 	if len(fwdPkts) > 0 {
 		d.receiver.SendRTCP(fwdPkts)
-	}
-
-	// only forward audio track's fractionlost to publiser
-	if d.Kind() == webrtc.RTPCodecTypeAudio {
-		d.receiver.HandleDownTrackFractionLost(maxRatePacketLoss)
 	}
 }
 
