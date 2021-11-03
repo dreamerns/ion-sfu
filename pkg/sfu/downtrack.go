@@ -70,8 +70,9 @@ type DownTrack struct {
 	closeOnce               sync.Once
 
 	// Report helpers
-	octetCount  atomicUint32
-	packetCount atomicUint32
+	octetCount   atomicUint32
+	packetCount  atomicUint32
+	lossFraction atomicUint8
 
 	// Debug info
 	lastPli     atomicInt64
@@ -231,6 +232,7 @@ func (d *DownTrack) Mute(val bool) {
 	}
 	d.enabled.set(!val)
 	if val {
+		d.lossFraction.set(0)
 		d.reSync.set(val)
 	}
 }
@@ -261,6 +263,10 @@ func (d *DownTrack) CurrentSpatialLayer() int32 {
 
 func (d *DownTrack) TargetSpatialLayer() int32 {
 	return d.targetSpatialLayer.get()
+}
+
+func (d *DownTrack) MaxSpatialLayer() int32 {
+	return d.maxSpatialLayer.get()
 }
 
 // SwitchSpatialLayer switches the current layer
@@ -347,6 +353,10 @@ func (d *DownTrack) OnCloseHandler(fn func()) {
 
 func (d *DownTrack) OnBind(fn func()) {
 	d.onBind = fn
+}
+
+func (d *DownTrack) CurrentMaxLossFraction() uint8 {
+	return d.lossFraction.get()
 }
 
 func (d *DownTrack) AddReceiverReportListener(listener func(*DownTrack, *rtcp.ReceiverReport)) {
@@ -628,6 +638,7 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 					maxRatePacketLoss = r.FractionLost
 				}
 			}
+			d.lossFraction.set(maxRatePacketLoss)
 			if len(rr.Reports) > 0 {
 				d.listenerLock.RLock()
 				for _, l := range d.receiverReportListeners {
@@ -645,6 +656,7 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 			}
 		}
 	}
+
 	if d.trackType == SimulcastDownTrack && (maxRatePacketLoss != 0 || expectedMinBitrate != 0) {
 		d.handleLayerChange(maxRatePacketLoss, expectedMinBitrate)
 	}
