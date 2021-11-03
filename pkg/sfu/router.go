@@ -163,9 +163,6 @@ func (r *router) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.TrackRe
 			}
 			r.deleteReceiver(trackID, uint32(track.SSRC()))
 		})
-		recv.OnFractionLostFB(func(lost uint8) {
-			buff.SetLastFractionLostReport(lost)
-		})
 		publish = true
 	}
 
