@@ -7,7 +7,8 @@ require (
 	github.com/desertbit/timer v0.0.0-20180107155436-c41aec40b27f // indirect
 	github.com/gammazero/deque v0.1.0
 	github.com/gammazero/workerpool v1.1.2
-	github.com/go-logr/logr v1.0.0
+	github.com/go-logr/logr v1.2.0
+	github.com/go-logr/zerologr v1.2.0
 	github.com/gorilla/websocket v1.4.2
 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0
 	github.com/improbable-eng/grpc-web v0.13.0
@@ -23,13 +24,12 @@ require (
 	github.com/pion/webrtc/v3 v3.1.5
 	github.com/prometheus/client_golang v1.9.0
 	github.com/rs/cors v1.7.0 // indirect
-	github.com/rs/zerolog v1.23.0
+	github.com/rs/zerolog v1.26.0
 	github.com/soheilhy/cmux v0.1.4
 	github.com/sourcegraph/jsonrpc2 v0.0.0-20210201082850-366fbb520750
 	github.com/spf13/viper v1.7.1
 	github.com/stretchr/testify v1.7.0
-	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
-	golang.org/x/sys v0.0.0-20210806184541-e5e7981a1069 // indirect
+	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 	google.golang.org/grpc v1.35.0
 	google.golang.org/grpc/examples v0.0.0-20201209011439-fd32f6a4fefe // indirect
 	google.golang.org/protobuf v1.25.0
