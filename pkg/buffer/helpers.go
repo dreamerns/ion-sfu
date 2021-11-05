@@ -121,7 +121,9 @@ func (p *VP8) Unmarshal(payload []byte) error {
 			if payloadLen < idx+1 {
 				return errShortPacket
 			}
-			p.TID = (payload[idx] & 0xc0) >> 6
+			if p.TemporalSupported {
+				p.TID = (payload[idx] & 0xc0) >> 6
+			}
 		}
 		if idx >= payloadLen {
 			return errShortPacket

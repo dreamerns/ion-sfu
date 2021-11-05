@@ -69,8 +69,8 @@ type Buffer struct {
 	minPacketProbe     int
 	lastPacketRead     int
 	maxTemporalLayer   int32
-	bitrate            uint64
-	bitrateHelper      uint64
+	bitrate            atomic.Value
+	bitrateHelper      [4]uint64
 	lastSRNTPTime      uint64
 	lastSRRTPTime      uint32
 	lastSRRecv         int64 // Represents wall clock of the most recent sender report arrival
@@ -285,6 +285,17 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 			for i := uint16(1); i < diff; i++ {
 				var extSN uint32
 				msn := sn - i
+				// LK-TODO-START
+				// This check needs validation.
+				// This is meant to handle the case as follows
+				//   maxSeqNo = 65533, sn = 1
+				// which is a wrap around case.
+				// NACKs should be sent for 65534, 65535. Both those sequence
+				// numbers come from the previous cycle, but the check
+				// `b.maxSeqNo&0x8000 == 0` will not be satisfied.
+				//
+				// Looks like this is written for a number wrapping at 15-bits.
+				// LK-TODO-END
 				if msn > b.maxSeqNo && msn&0x8000 > 0 && b.maxSeqNo&0x8000 == 0 {
 					extSN = (b.cycles - maxSN) | uint32(msn)
 				} else {
@@ -296,6 +307,7 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		b.maxSeqNo = sn
 	} else if b.nack && (sn-b.maxSeqNo)&0x8000 > 0 {
 		var extSN uint32
+		// LK-TODO: See note above about checking this condition
 		if sn > b.maxSeqNo && sn&0x8000 > 0 && b.maxSeqNo&0x8000 == 0 {
 			extSN = (b.cycles - maxSN) | uint32(sn)
 		} else {
@@ -325,7 +337,6 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 	}
 
 	b.stats.TotalByte += uint64(len(pkt))
-	b.bitrateHelper += uint64(len(pkt))
 	b.stats.PacketCount++
 
 	ep := ExtPacket{
@@ -335,6 +346,13 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		Arrival: arrivalTime,
 	}
 
+	if len(p.Payload) == 0 {
+		// padding only packet, nothing else to do
+		b.extPackets.PushBack(&ep)
+		return
+	}
+
+	temporalLayer := int32(0)
 	switch b.mime {
 	case "video/vp8":
 		vp8Packet := VP8{}
@@ -343,6 +361,7 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		}
 		ep.Payload = vp8Packet
 		ep.KeyFrame = vp8Packet.IsKeyFrame
+		temporalLayer = int32(vp8Packet.TID)
 	case "video/h264":
 		ep.KeyFrame = isH264Keyframe(p.Payload)
 	}
@@ -401,12 +420,27 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		}
 	}
 
+	b.bitrateHelper[temporalLayer] += uint64(len(pkt))
 	if diff >= reportDelta {
-		br := (8 * b.bitrateHelper * uint64(reportDelta)) / uint64(diff)
-		atomic.StoreUint64(&b.bitrate, br)
+		// LK-TODO-START
+		// As this happens in the data path, if there are no packets received
+		// in an interval, the bitrate is stuck with the old value. GetBitrate()
+		// method in sfu.Receiver uses the availableLayers set by stream
+		// tracker to report 0 bitrate if a layer is not available. But, stream
+		// tracker is not run for the lowest layer. So, if the lowest layer stops,
+		// stale bitrate will be reported. The simplest thing might be to run the
+		// stream tracker on all layers to address this. Another option to look at
+		// is some monitoring loop running at low frequency and reporting bitrate.
+		// LK-TODO-END
+		bitrates := make([]uint64, len(b.bitrateHelper))
+		for i := 0; i < len(b.bitrateHelper); i++ {
+			br := (8 * b.bitrateHelper[i] * uint64(reportDelta)) / uint64(diff)
+			bitrates[i] = br
+			b.bitrateHelper[i] = 0
+		}
+		b.bitrate.Store(bitrates)
 		b.feedbackCB(b.getRTCP())
 		b.lastReport = arrivalTime
-		b.bitrateHelper = 0
 	}
 }
 
@@ -431,7 +465,7 @@ func (b *Buffer) buildNACKPacket() []rtcp.Packet {
 }
 
 func (b *Buffer) buildREMBPacket() *rtcp.ReceiverEstimatedMaximumBitrate {
-	br := b.bitrate
+	br := b.Bitrate()
 	if b.stats.LostRate < 0.02 {
 		br = uint64(float64(br)*1.09) + 2000
 	}
@@ -534,7 +568,50 @@ func (b *Buffer) GetPacket(buff []byte, sn uint16) (int, error) {
 
 // Bitrate returns the current publisher stream bitrate.
 func (b *Buffer) Bitrate() uint64 {
-	return atomic.LoadUint64(&b.bitrate)
+	bitrates, ok := b.bitrate.Load().([]uint64)
+	bitrate := uint64(0)
+	if ok {
+		for _, b := range bitrates {
+			bitrate += b
+		}
+	}
+	return bitrate
+}
+
+// BitrateTemporal returns the current publisher stream bitrate temporal layer wise.
+func (b *Buffer) BitrateTemporal() []uint64 {
+	bitrates, ok := b.bitrate.Load().([]uint64)
+	if !ok {
+		return make([]uint64, 4)
+	}
+
+	// copy and return
+	brs := make([]uint64, len(bitrates))
+	copy(brs, bitrates)
+
+	return brs
+}
+
+// BitrateTemporalCumulative returns the current publisher stream bitrate temporal layer accumulated with lower temporal layers.
+func (b *Buffer) BitrateTemporalCumulative() []uint64 {
+	bitrates, ok := b.bitrate.Load().([]uint64)
+	if !ok {
+		return make([]uint64, 4)
+	}
+
+	// copy and process
+	brs := make([]uint64, len(bitrates))
+	copy(brs, bitrates)
+
+	for i := len(brs) - 1; i >= 1; i-- {
+		if brs[i] != 0 {
+			for j := i - 1; j >= 0; j-- {
+				brs[i] += brs[j]
+			}
+		}
+	}
+
+	return brs
 }
 
 func (b *Buffer) MaxTemporalLayer() int32 {

@@ -31,6 +31,8 @@ type Receiver interface {
 	SetUpTrackPaused(paused bool)
 	HasSpatialLayer(layer int32) bool
 	GetBitrate() [3]uint64
+	GetBitrateTemporal() [3][4]uint64
+	GetBitrateTemporalCumulative() [3][4]uint64
 	GetMaxTemporalLayer() [3]int32
 	RetransmitPackets(track *DownTrack, packets []packetMeta) error
 	DeleteDownTrack(peerID string)
@@ -202,6 +204,15 @@ func (w *WebRTCReceiver) AddUpTrack(track *webrtc.TrackRemote, buff *buffer.Buff
 		w.addAvailableLayer(uint16(layer), false)
 
 		w.downTrackMu.RLock()
+		// LK-TODO-START
+		// DownTrack layer change should not happen directly from here.
+		// Layer switching should be controlled by StreamAllocator. So, this
+		// should call into DownTrack to notify availability of a new layer.
+		// One challenge to think about is that the layer bitrate is not available
+		// for a second after start up as sfu.Buffer reports at that cadence.
+		// One possibility is to initialize sfu.Buffer with default bitrate
+		// based on layer.
+		// LK-TODO-END
 		for _, dt := range w.downTracks {
 			if dt != nil {
 				if (bestQualityFirst && layer > dt.CurrentSpatialLayer()) ||
@@ -278,6 +289,12 @@ func (w *WebRTCReceiver) AddDownTrack(track *DownTrack, bestQualityFirst bool) {
 		track.trackType = SimulcastDownTrack
 		track.payload = packetFactory.Get().(*[]byte)
 	} else {
+		// LK-TODO-START
+		// check if any webrtc client does more than one temporal layer when not simulcasting.
+		// Maybe okay to just set the max temporal layer to 2 even in this case.
+		// Don't think there is any harm is setting it at 2 if the upper layers are
+		// not going to be there.
+		// LK-TODO-END
 		track.SetInitialLayers(0, 0)
 		track.trackType = SimpleDownTrack
 	}
@@ -299,12 +316,12 @@ func (w *WebRTCReceiver) HasSpatialLayer(layer int32) bool {
 	return false
 }
 
-func (w *WebRTCReceiver) downtrackLayerChange(layers []uint16) {
+func (w *WebRTCReceiver) downtrackLayerChange(layers []uint16, layerAdded bool) {
 	w.downTrackMu.RLock()
 	defer w.downTrackMu.RUnlock()
 	for _, dt := range w.downTracks {
 		if dt != nil {
-			_, _ = dt.UptrackLayersChange(layers)
+			_, _ = dt.UptrackLayersChange(layers, layerAdded)
 		}
 	}
 }
@@ -329,7 +346,7 @@ func (w *WebRTCReceiver) addAvailableLayer(layer uint16, updateDownTrack bool) {
 	w.upTrackMu.Unlock()
 
 	if updateDownTrack {
-		w.downtrackLayerChange(layers)
+		w.downtrackLayerChange(layers, true)
 	}
 }
 
@@ -349,7 +366,7 @@ func (w *WebRTCReceiver) removeAvailableLayer(layer uint16) {
 	w.availableLayers.Store(newLayers)
 	w.upTrackMu.Unlock()
 	// need to immediately switch off unavailable layers
-	w.downtrackLayerChange(newLayers)
+	w.downtrackLayerChange(newLayers, false)
 }
 
 func (w *WebRTCReceiver) GetBitrate() [3]uint64 {
@@ -358,7 +375,50 @@ func (w *WebRTCReceiver) GetBitrate() [3]uint64 {
 	defer w.bufferMu.RUnlock()
 	for i, buff := range w.buffers {
 		if buff != nil {
-			br[i] = buff.Bitrate()
+			if w.HasSpatialLayer(int32(i)) {
+				br[i] = buff.Bitrate()
+			} else {
+				br[i] = 0
+			}
+		}
+	}
+	return br
+}
+
+func (w *WebRTCReceiver) GetBitrateTemporal() [3][4]uint64 {
+	var br [3][4]uint64
+	w.bufferMu.RLock()
+	defer w.bufferMu.RUnlock()
+	for i, buff := range w.buffers {
+		if buff != nil {
+			tls := make([]uint64, 4)
+			if w.HasSpatialLayer(int32(i)) {
+				tls = buff.BitrateTemporal()
+			}
+
+			for j := 0; j < len(br[i]); j++ {
+				br[i][j] = tls[j]
+			}
+		}
+	}
+	return br
+}
+
+func (w *WebRTCReceiver) GetBitrateTemporalCumulative() [3][4]uint64 {
+	// LK-TODO: For SVC tracks, need to accumulate across spatial layers also
+	var br [3][4]uint64
+	w.bufferMu.RLock()
+	defer w.bufferMu.RUnlock()
+	for i, buff := range w.buffers {
+		if buff != nil {
+			tls := make([]uint64, 4)
+			if w.HasSpatialLayer(int32(i)) {
+				tls = buff.BitrateTemporalCumulative()
+			}
+
+			for j := 0; j < len(br[i]); j++ {
+				br[i][j] = tls[j]
+			}
 		}
 	}
 	return br
@@ -429,6 +489,7 @@ func (w *WebRTCReceiver) RetransmitPackets(track *DownTrack, packets []packetMet
 	if w.nackWorker.Stopped() {
 		return io.ErrClosedPipe
 	}
+	// LK-TODO: should move down track specific bits into there
 	w.nackWorker.Submit(func() {
 		src := packetFactory.Get().(*[]byte)
 		for _, meta := range packets {
@@ -555,6 +616,11 @@ func (w *WebRTCReceiver) forwardRTP(layer int32) {
 }
 
 func (w *WebRTCReceiver) writeRTP(layer int32, dt *DownTrack, pkt *buffer.ExtPacket, pli []rtcp.Packet) {
+	// LK-TODO-START
+	// Ideally this code should also be moved into the DownTrack
+	// structure to keep things modular. Let the down track code
+	// make decision on forwarding or not
+	// LK-TODO-END
 	if w.isSimulcast {
 		targetLayer := dt.TargetSpatialLayer()
 		currentLayer := dt.CurrentSpatialLayer()
@@ -567,6 +633,16 @@ func (w *WebRTCReceiver) writeRTP(layer int32, dt *DownTrack, pkt *buffer.ExtPac
 				w.SendRTCP(pli)
 			}
 		}
+		// LK-TODO-START
+		// Probably need a control here to stop forwarding current layer
+		// if the current layer is higher than target layer, i. e. target layer
+		// could have been switched down due to bandwidth constraints and
+		// continuing to forward higher layer is only going to exacerbate the issue.
+		// Note that the client might have also requested a lower layer. So, it
+		// would nice to distinguish between client requested downgrade vs bandwidth
+		// constrained downgrade and stop higher layer only in the bandwidth
+		// constrained case.
+		// LK-TODO-END
 		if currentLayer != layer {
 			dt.pktsDropped.add(1)
 			return
