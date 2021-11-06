@@ -58,7 +58,7 @@
 //
 //  States:
 //  ------
-//  - State_PRE_ESTIMATE: Before the first estimate is available.
+//  - State_PRE_COMMIT: Before the first estimate is committed.
 //                        Estimated channel capacity is initialized to some
 //                        arbitrarily high value to start streaming immediately.
 //                        Serves two purposes
@@ -126,7 +126,7 @@ const (
 type State int
 
 const (
-	State_PRE_ESTIMATE State = iota
+	State_PRE_COMMIT State = iota
 	State_STABLE
 	State_DEFICIENT
 	State_GRATUITOUS_PROBING
@@ -172,6 +172,7 @@ type StreamAllocator struct {
 	committedChannelCapacity uint64
 	lastCommitTime           time.Time
 	prevReceivedEstimate     uint64
+	receivedEstimate         uint64
 	lastEstimateDecreaseTime time.Time
 
 	boostMode              BoostMode
@@ -199,12 +200,12 @@ func NewStreamAllocator() *StreamAllocator {
 	s := &StreamAllocator{
 		committedChannelCapacity: InitialChannelCapacity,
 		lastCommitTime:           time.Now(),
-		prevReceivedEstimate:     InitialChannelCapacity,
+		receivedEstimate:         InitialChannelCapacity,
 		lastEstimateDecreaseTime: time.Now(),
 		boostMode:                BoostMode_LAYER,
 		tracks:                   make(map[string]*Track),
 		prober:                   NewProber(),
-		state:                    State_PRE_ESTIMATE,
+		state:                    State_PRE_COMMIT,
 		eventCh:                  make(chan []Event, 10),
 		runningCh:                make(chan struct{}),
 	}
@@ -311,18 +312,8 @@ func (s *StreamAllocator) onREMB(downTrack *DownTrack, remb *rtcp.ReceiverEstima
 		return
 	}
 
-	// commit channel capacity estimate under following rules
-	//   1. prevReceivedEstimate = InitialChannelCapacity => first received estimate
-	//   2. Abs(prevReceivedEstimate - receivedEstimate) < EstimateEpsilon => estimate stable
-	//   3. time.Since(lastCommitTime) > EstimateCommitMs => to catch long oscillating estimate
-	receivedEstimate := uint64(remb.Bitrate)
-	prevReceivedEstimate := s.prevReceivedEstimate
-	s.prevReceivedEstimate = receivedEstimate
-	if prevReceivedEstimate != InitialChannelCapacity && math.Abs(float64(receivedEstimate)-float64(prevReceivedEstimate)) > EstimateEpsilon {
-		s.estimateMu.Unlock()
-		return
-	}
-
+	s.prevReceivedEstimate = s.receivedEstimate
+	s.receivedEstimate = uint64(remb.Bitrate)
 	signal := s.maybeCommitEstimate()
 	s.estimateMu.Unlock()
 
@@ -478,8 +469,8 @@ func (s *StreamAllocator) ping() {
 // LK-TODO-END
 func (s *StreamAllocator) runStateMachine(event Event) {
 	switch s.state {
-	case State_PRE_ESTIMATE:
-		s.runStatePreEstimate(event)
+	case State_PRE_COMMIT:
+		s.runStatePreCommit(event)
 	case State_STABLE:
 		s.runStateStable(event)
 	case State_DEFICIENT:
@@ -494,7 +485,7 @@ func (s *StreamAllocator) runStateMachine(event Event) {
 // AVAILABLE_LAYERS_ADD/REMOVE should be how track start should
 // be getting an allocation.
 // LK-TODO-END
-func (s *StreamAllocator) runStatePreEstimate(event Event) {
+func (s *StreamAllocator) runStatePreCommit(event Event) {
 	switch event.Signal {
 	case Signal_ADD_TRACK:
 		s.allocate()
@@ -626,23 +617,31 @@ func (s *StreamAllocator) setState(state State) {
 }
 
 func (s *StreamAllocator) maybeCommitEstimate() Signal {
-	if s.committedChannelCapacity != InitialChannelCapacity && time.Since(s.lastCommitTime) < EstimateCommitMs {
+	// commit channel capacity estimate under following rules
+	//   1. Abs(receivedEstimate - prevReceivedEstimate) < EstimateEpsilon => estimate stable
+	//   2. time.Since(lastCommitTime) > EstimateCommitMs => to catch long oscillating estimate
+	if math.Abs(float64(s.receivedEstimate)-float64(s.prevReceivedEstimate)) > EstimateEpsilon {
+		// too large a change, wait for estimate to settle
 		return Signal_NONE
 	}
 
-	if s.prevReceivedEstimate == s.committedChannelCapacity {
-		// no change in estimate
-		s.lastCommitTime = time.Now()
+	if time.Since(s.lastCommitTime) < EstimateCommitMs {
+		// don't commit too often
+		return Signal_NONE
+	}
+
+	if s.receivedEstimate == s.committedChannelCapacity {
+		// no change in estimate, no need to commit
 		return Signal_NONE
 	}
 
 	signal := Signal_ESTIMATE_INCREASE
-	if s.prevReceivedEstimate < s.committedChannelCapacity {
+	if s.receivedEstimate < s.committedChannelCapacity {
 		signal = Signal_ESTIMATE_DECREASE
 		s.lastEstimateDecreaseTime = time.Now()
 	}
 
-	s.committedChannelCapacity = s.prevReceivedEstimate
+	s.committedChannelCapacity = s.receivedEstimate
 	s.lastCommitTime = time.Now()
 
 	return signal

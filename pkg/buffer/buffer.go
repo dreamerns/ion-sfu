@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	maxSN = 1 << 16
+	MaxSN = 1 << 16
 
 	reportDelta = 1e9
 )
@@ -119,6 +119,7 @@ func NewBuffer(ssrc uint32, vp, ap *sync.Pool, logger logr.Logger) *Buffer {
 		audioPool: ap,
 		logger:    logger,
 	}
+	b.bitrate.Store(make([]uint64, len(b.bitrateHelper)))
 	b.extPackets.SetMinCapacity(7)
 	return b
 }
@@ -278,7 +279,7 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		b.lastReport = arrivalTime
 	} else if (sn-b.maxSeqNo)&0x8000 == 0 {
 		if sn < b.maxSeqNo {
-			b.cycles += maxSN
+			b.cycles += MaxSN
 		}
 		if b.nack {
 			diff := sn - b.maxSeqNo
@@ -297,7 +298,7 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 				// Looks like this is written for a number wrapping at 15-bits.
 				// LK-TODO-END
 				if msn > b.maxSeqNo && msn&0x8000 > 0 && b.maxSeqNo&0x8000 == 0 {
-					extSN = (b.cycles - maxSN) | uint32(msn)
+					extSN = (b.cycles - MaxSN) | uint32(msn)
 				} else {
 					extSN = b.cycles | uint32(msn)
 				}
@@ -309,7 +310,7 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		var extSN uint32
 		// LK-TODO: See note above about checking this condition
 		if sn > b.maxSeqNo && sn&0x8000 > 0 && b.maxSeqNo&0x8000 == 0 {
-			extSN = (b.cycles - maxSN) | uint32(sn)
+			extSN = (b.cycles - MaxSN) | uint32(sn)
 		} else {
 			extSN = b.cycles | uint32(sn)
 		}
@@ -412,8 +413,6 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		}
 	}
 
-	diff := arrivalTime - b.lastReport
-
 	if b.nacker != nil {
 		if r := b.buildNACKPacket(); r != nil {
 			b.feedbackCB(r)
@@ -421,6 +420,8 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 	}
 
 	b.bitrateHelper[temporalLayer] += uint64(len(pkt))
+
+	diff := arrivalTime - b.lastReport
 	if diff >= reportDelta {
 		// LK-TODO-START
 		// As this happens in the data path, if there are no packets received
@@ -432,7 +433,10 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 		// stream tracker on all layers to address this. Another option to look at
 		// is some monitoring loop running at low frequency and reporting bitrate.
 		// LK-TODO-END
-		bitrates := make([]uint64, len(b.bitrateHelper))
+		bitrates, ok := b.bitrate.Load().([]uint64)
+		if !ok {
+			bitrates = make([]uint64, len(b.bitrateHelper))
+		}
 		for i := 0; i < len(b.bitrateHelper); i++ {
 			br := (8 * b.bitrateHelper[i] * uint64(reportDelta)) / uint64(diff)
 			bitrates[i] = br
@@ -582,7 +586,7 @@ func (b *Buffer) Bitrate() uint64 {
 func (b *Buffer) BitrateTemporal() []uint64 {
 	bitrates, ok := b.bitrate.Load().([]uint64)
 	if !ok {
-		return make([]uint64, 4)
+		return make([]uint64, len(b.bitrateHelper))
 	}
 
 	// copy and return
@@ -596,7 +600,7 @@ func (b *Buffer) BitrateTemporal() []uint64 {
 func (b *Buffer) BitrateTemporalCumulative() []uint64 {
 	bitrates, ok := b.bitrate.Load().([]uint64)
 	if !ok {
-		return make([]uint64, 4)
+		return make([]uint64, len(b.bitrateHelper))
 	}
 
 	// copy and process

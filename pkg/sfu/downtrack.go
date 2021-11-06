@@ -30,7 +30,9 @@ const (
 )
 
 var (
-	ErrPaddingNotOnFrameBoundary = errors.New("padding cannot send on non-frame boundary")
+	ErrOutOfOrderSequenceNumberCacheMiss = errors.New("out-of-order sequence number not found in cache")
+	ErrPaddingOnlyPacket                 = errors.New("padding only packet that need not be forwarded")
+	ErrPaddingNotOnFrameBoundary         = errors.New("padding cannot send on non-frame boundary")
 )
 
 type ReceiverReportListener func(dt *DownTrack, report *rtcp.ReceiverReport)
@@ -60,7 +62,7 @@ type DownTrack struct {
 	reSync   atomicBool
 	lastSSRC atomicUint32
 
-	munger Munger
+	munger *Munger
 
 	simulcast        simulcastTrackHelpers
 	maxSpatialLayer  atomicInt32
@@ -116,6 +118,7 @@ func NewDownTrack(c webrtc.RTPCodecCapability, r Receiver, bf *buffer.Factory, p
 		bufferFactory: bf,
 		receiver:      r,
 		codec:         c,
+		munger:        NewMunger(),
 	}, nil
 }
 
@@ -245,12 +248,6 @@ func (d *DownTrack) WriteRTP(p *buffer.ExtPacket, layer int32) error {
 		return nil
 	}
 
-	// drop padding only forwarded packet
-	if len(p.Packet.Payload) == 0 && d.packetCount.get() > 0 {
-		d.munger.addSnOffset(1)
-		return nil
-	}
-
 	switch d.trackType {
 	case SimpleDownTrack:
 		return d.writeSimpleRTP(p)
@@ -294,7 +291,7 @@ func (d *DownTrack) WritePaddingRTP(bytesToSend int) int {
 			size = RTPPaddingMaxPayloadSize + RTPPaddingEstimatedHeaderSize
 		}
 
-		sn, ts, err := d.munger.updateAndGetPaddingSnTs()
+		sn, ts, err := d.munger.UpdateAndGetPaddingSnTs()
 		if err != nil {
 			return bytesSent
 		}
@@ -759,19 +756,29 @@ func (d *DownTrack) writeSimpleRTP(extPkt *buffer.ExtPacket) error {
 			// we support switch track (i. e. same down track switches
 			// to a different up track), this needs to be looked at.
 			// LK-TODO-END
-			d.munger.updateSnTsOffsets(extPkt, 1, 1)
+			d.munger.UpdateSnTsOffsets(extPkt, 1, 1)
+		} else {
+			d.munger.SetLastSnTs(extPkt)
 		}
 		d.lastSSRC.set(extPkt.Packet.SSRC)
 		d.reSync.set(false)
 	}
 
-	// LK-TODO maybe include RTP header size also
-	d.UpdateStats(uint32(len(extPkt.Packet.Payload)))
+	newSN, newTS, err := d.munger.UpdateAndGetSnTs(extPkt)
+	if err != nil {
+		if err == ErrPaddingOnlyPacket {
+			return nil
+		}
 
-	newSN, newTS := d.munger.updateAndGetSnTs(extPkt)
+		d.pktsDropped.add(1)
+		return err
+	}
 	if d.sequencer != nil {
 		d.sequencer.push(extPkt.Packet.SequenceNumber, newSN, newTS, 0, extPkt.Head)
 	}
+
+	// LK-TODO maybe include RTP header size also
+	d.UpdateStats(uint32(len(extPkt.Packet.Payload)))
 
 	hdr := extPkt.Packet.Header
 	hdr.PayloadType = d.payloadType
@@ -779,7 +786,7 @@ func (d *DownTrack) writeSimpleRTP(extPkt *buffer.ExtPacket) error {
 	hdr.SequenceNumber = newSN
 	hdr.SSRC = d.ssrc
 
-	err := d.WriteRTPHeaderExtensions(&hdr)
+	err = d.WriteRTPHeaderExtensions(&hdr)
 	if err != nil {
 		return err
 	}
@@ -807,6 +814,12 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket, layer int32) err
 		// Wait for a keyframe to sync new source
 		if reSync && !extPkt.KeyFrame {
 			// Packet is not a keyframe, discard it
+			// LK-TODO-START
+			// Some of this happens is happening in sfu.Receiver also.
+			// If performance is not a concern, sfu.Receiver should send
+			// all the packets to down tracks and down track should be
+			// the only one deciding whether to switch/forward/drop
+			// LK-TODO-END
 			d.receiver.SendRTCP([]rtcp.Packet{
 				&rtcp.PictureLossIndication{SenderSSRC: d.ssrc, MediaSSRC: extPkt.Packet.SSRC},
 			})
@@ -834,8 +847,8 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket, layer int32) err
 	// LK-TODO-START
 	// The below offset calculation is not technically correct.
 	// Timestamps based on the system time of an intermediate box like
-	// SFU is not going to be accurate. Packets arrival/procesing
-	// are subject vagaries of network delays, SFU processing etc.
+	// SFU is not going to be accurate. Packets arrival/processing
+	// are subject to vagaries of network delays, SFU processing etc.
 	// But, the correct way is a lot harder. Will have to
 	// look at RTCP SR to get timestamps and figure out alignment
 	// of layers and use that during layer switch. That can
@@ -857,9 +870,9 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket, layer int32) err
 		if td == 0 {
 			td = 1
 		}
-		d.munger.updateSnTsOffsets(extPkt, 1, td)
+		d.munger.UpdateSnTsOffsets(extPkt, 1, td)
 	} else if lTSCalc == 0 {
-		d.munger.setLastSnTs(extPkt)
+		d.munger.SetLastSnTs(extPkt)
 		if d.mime == "video/vp8" {
 			if vp8, ok := extPkt.Payload.(buffer.VP8); ok {
 				d.simulcast.temporalSupported = vp8.TemporalSupported
@@ -878,13 +891,21 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket, layer int32) err
 			drop := false
 			if payload, picID, tlz0Idx, drop = setVP8TemporalLayer(extPkt, d); drop {
 				// Pkt not in temporal getLayer update sequence number offset to avoid gaps
-				d.munger.addSnOffset(1)
+				d.munger.AddSnOffset(1)
 				return nil
 			}
 		}
 	}
 
-	newSN, newTS := d.munger.updateAndGetSnTs(extPkt)
+	newSN, newTS, err := d.munger.UpdateAndGetSnTs(extPkt)
+	if err != nil {
+		if err == ErrPaddingOnlyPacket {
+			return nil
+		}
+
+		d.pktsDropped.add(1)
+		return err
+	}
 	if d.sequencer != nil {
 		if meta := d.sequencer.push(extPkt.Packet.SequenceNumber, newSN, newTS, uint8(csl), extPkt.Head); meta != nil &&
 			d.simulcast.temporalSupported && d.mime == "video/vp8" {
@@ -904,7 +925,7 @@ func (d *DownTrack) writeSimulcastRTP(extPkt *buffer.ExtPacket, layer int32) err
 	hdr.SSRC = d.ssrc
 	hdr.PayloadType = d.payloadType
 
-	err := d.WriteRTPHeaderExtensions(&hdr)
+	err = d.WriteRTPHeaderExtensions(&hdr)
 	if err != nil {
 		return err
 	}
@@ -1068,15 +1089,16 @@ func (d *DownTrack) getSRStats() (octets, packets uint32) {
 func (d *DownTrack) DebugInfo() map[string]interface{} {
 	mungerParams := d.munger.getParams()
 	stats := map[string]interface{}{
-		"LastSN":         mungerParams.lastSN,
-		"SNOffset":       mungerParams.snOffset,
-		"LastTS":         mungerParams.lastTS,
-		"TSOffset":       mungerParams.tsOffset,
-		"LastMarker":     mungerParams.lastMarker,
-		"LastRTP":        d.lastRTP.get(),
-		"LastPli":        d.lastPli.get(),
-		"PacketsDropped": d.pktsDropped.get(),
-		"PacketsMuted":   d.pktsMuted.get(),
+		"HighestIncomingSN": mungerParams.highestIncomingSN,
+		"LastSN":            mungerParams.lastSN,
+		"SNOffset":          mungerParams.snOffset,
+		"LastTS":            mungerParams.lastTS,
+		"TSOffset":          mungerParams.tsOffset,
+		"LastMarker":        mungerParams.lastMarker,
+		"LastRTP":           d.lastRTP.get(),
+		"LastPli":           d.lastPli.get(),
+		"PacketsDropped":    d.pktsDropped.get(),
+		"PacketsMuted":      d.pktsMuted.get(),
 	}
 
 	senderReport := d.CreateSenderReport()
@@ -1104,11 +1126,14 @@ func (d *DownTrack) DebugInfo() map[string]interface{} {
 // munger
 //
 type MungerParams struct {
-	snOffset   uint16
-	lastSN     uint16
-	tsOffset   uint32
-	lastTS     uint32
-	lastMarker bool
+	highestIncomingSN uint16
+	lastSN            uint16
+	snOffset          uint16
+	lastTS            uint32
+	tsOffset          uint32
+	lastMarker        bool
+
+	missingSNs map[uint16]uint16
 }
 
 type Munger struct {
@@ -1117,59 +1142,112 @@ type Munger struct {
 	MungerParams
 }
 
+func NewMunger() *Munger {
+	return &Munger{MungerParams: MungerParams{
+		missingSNs: make(map[uint16]uint16, 10),
+	}}
+}
+
 func (m *Munger) getParams() MungerParams {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
 	return MungerParams{
-		snOffset:   m.snOffset,
-		lastSN:     m.lastSN,
-		tsOffset:   m.tsOffset,
-		lastTS:     m.lastTS,
-		lastMarker: m.lastMarker,
+		highestIncomingSN: m.highestIncomingSN,
+		lastSN:            m.lastSN,
+		snOffset:          m.snOffset,
+		lastTS:            m.lastTS,
+		tsOffset:          m.tsOffset,
+		lastMarker:        m.lastMarker,
 	}
 }
 
-func (m *Munger) setLastSnTs(extPkt *buffer.ExtPacket) {
+func (m *Munger) SetLastSnTs(extPkt *buffer.ExtPacket) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	m.highestIncomingSN = extPkt.Packet.SequenceNumber - 1
 	m.lastSN = extPkt.Packet.SequenceNumber
 	m.lastTS = extPkt.Packet.Timestamp
 }
 
-func (m *Munger) updateSnTsOffsets(extPkt *buffer.ExtPacket, snAdjust uint16, tsAdjust uint32) {
+func (m *Munger) UpdateSnTsOffsets(extPkt *buffer.ExtPacket, snAdjust uint16, tsAdjust uint32) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	m.highestIncomingSN = extPkt.Packet.SequenceNumber - 1
 	m.snOffset = extPkt.Packet.SequenceNumber - m.lastSN - snAdjust
 	m.tsOffset = extPkt.Packet.Timestamp - m.lastTS - tsAdjust
 }
 
-func (m *Munger) addSnOffset(snAdjust uint16) {
+func (m *Munger) AddSnOffset(snAdjust uint16) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
 	m.snOffset += snAdjust
 }
 
-func (m *Munger) updateAndGetSnTs(extPkt *buffer.ExtPacket) (uint16, uint32) {
+func (m *Munger) UpdateAndGetSnTs(extPkt *buffer.ExtPacket) (uint16, uint32, error) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	// if out-of-order, look up missing sequence number cache
+	if !extPkt.Head {
+		snOffset, ok := m.missingSNs[extPkt.Packet.SequenceNumber]
+		if !ok {
+			return 0, 0, ErrOutOfOrderSequenceNumberCacheMiss
+		}
+
+		delete(m.missingSNs, extPkt.Packet.SequenceNumber)
+		return extPkt.Packet.SequenceNumber - snOffset, extPkt.Packet.Timestamp - m.tsOffset, nil
+	}
+
+	// if there are gaps, record it in missing sequence number cache
+	if extPkt.Packet.SequenceNumber-m.highestIncomingSN != 1 {
+		if extPkt.Packet.SequenceNumber > m.highestIncomingSN {
+			for lostSN := m.highestIncomingSN + 1; lostSN < extPkt.Packet.SequenceNumber; lostSN++ {
+				m.missingSNs[lostSN] = m.snOffset
+			}
+		} else {
+			for lostSN := m.highestIncomingSN + 1; lostSN <= uint16(buffer.MaxSN-1); lostSN++ {
+				m.missingSNs[lostSN] = m.snOffset
+			}
+			for lostSN := uint16(0); lostSN < extPkt.Packet.SequenceNumber; lostSN++ {
+				m.missingSNs[lostSN] = m.snOffset
+			}
+		}
+	} else {
+		// if padding only packet, can be dropped and sequence number adjusted
+		// as it is contiguous and in order. That means this is the highest
+		// incoming sequence number and it is a good point to adjust
+		// sequence number offset.
+		if len(extPkt.Packet.Payload) == 0 {
+			m.highestIncomingSN = extPkt.Packet.SequenceNumber
+			m.snOffset += 1
+			return 0, 0, ErrPaddingOnlyPacket
+		}
+	}
+
+	// in-order incoming packet, may or may not be contiguous.
+	// In the case of loss (i. e. incoming sequence number is not contiguous),
+	// forward even if it is a padding only packet. With temporal scalability,
+	// it is unclear if the current packet should be dropped if it is not
+	// contiguous. Hence forward anything that is not contiguous.
+	// Reference: http://www.rtcbits.com/2017/04/howto-implement-temporal-scalability.html
 	mungedSN := extPkt.Packet.SequenceNumber - m.snOffset
 	mungedTS := extPkt.Packet.Timestamp - m.tsOffset
 
 	if extPkt.Head {
+		m.highestIncomingSN = extPkt.Packet.SequenceNumber
 		m.lastSN = mungedSN
 		m.lastTS = mungedTS
 		m.lastMarker = extPkt.Packet.Marker
 	}
 
-	return mungedSN, mungedTS
+	return mungedSN, mungedTS, nil
 }
 
-func (m *Munger) updateAndGetPaddingSnTs() (uint16, uint32, error) {
+func (m *Munger) UpdateAndGetPaddingSnTs() (uint16, uint32, error) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 

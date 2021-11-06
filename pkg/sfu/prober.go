@@ -275,7 +275,9 @@ func (c *Cluster) Start() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	c.startTime = time.Now()
+	if c.startTime.IsZero() {
+		c.startTime = time.Now()
+	}
 }
 
 func (c *Cluster) GetSleepDuration() time.Duration {

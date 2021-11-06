@@ -103,8 +103,8 @@ func (s *StreamTracker) Observe(sn uint16) {
 	if s.paused.get() {
 		return
 	}
-	// ignore smaller SNs
-	if sn != 0 && (sn-s.lastSN)&0x8000 == 1 {
+	// ignore out-of-order SNs
+	if (sn - s.lastSN) > uint16(1<<15) {
 		return
 	}
 	s.lastSN = sn

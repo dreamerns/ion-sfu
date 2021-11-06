@@ -7,8 +7,9 @@ import (
 )
 
 var (
-	errShortPacket = errors.New("packet is not large enough")
-	errNilPacket   = errors.New("invalid nil packet")
+	errShortPacket   = errors.New("packet is not large enough")
+	errNilPacket     = errors.New("invalid nil packet")
+	errInvalidPacket = errors.New("invalid packet")
 )
 
 type atomicBool int32
@@ -83,6 +84,9 @@ func (p *VP8) Unmarshal(payload []byte) error {
 		p.TemporalSupported = payload[idx]&0x20 > 0
 		K := payload[idx]&0x10 > 0
 		L := payload[idx]&0x40 > 0
+		if L && !p.TemporalSupported {
+			return errInvalidPacket
+		}
 		// Check for PictureID
 		if payload[idx]&0x80 > 0 {
 			idx++
