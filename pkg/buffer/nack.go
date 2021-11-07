@@ -64,6 +64,7 @@ func (n *nackQueue) pairs(headSN uint32) ([]rtcp.NackPair, bool) {
 	askKF := false
 	var np rtcp.NackPair
 	var nps []rtcp.NackPair
+	lostIdx := -1
 	for _, nck := range n.nacks {
 		if nck.nacked >= maxNackTimes {
 			if nck.sn > n.kfSN {
@@ -82,17 +83,22 @@ func (n *nackQueue) pairs(headSN uint32) ([]rtcp.NackPair, bool) {
 			nacked: nck.nacked + 1,
 		}
 		i++
-		if np.PacketID == 0 || uint16(nck.sn) > np.PacketID+16 {
-			if np.PacketID != 0 {
+
+		// first nackpair or need a new nackpair
+		if lostIdx < 0 || nck.sn > n.nacks[lostIdx].sn+16 {
+			if lostIdx >= 0 {
 				nps = append(nps, np)
 			}
 			np.PacketID = uint16(nck.sn)
 			np.LostPackets = 0
+			lostIdx = i - 1
 			continue
 		}
-		np.LostPackets |= 1 << (uint16(nck.sn) - np.PacketID - 1)
+		np.LostPackets |= 1 << ((nck.sn) - n.nacks[lostIdx].sn - 1)
 	}
-	if np.PacketID != 0 {
+
+	// append last nackpair
+	if lostIdx != -1 {
 		nps = append(nps, np)
 	}
 	n.nacks = n.nacks[:i]

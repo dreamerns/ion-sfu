@@ -32,6 +32,21 @@ func Test_nackQueue_pairs(t *testing.T) {
 			}},
 		},
 		{
+			name: "Must return correct pair wrap",
+			fields: fields{
+				nacks: nil,
+			},
+			args: []uint32{65536, 65538, 65540, 65541, 65566, 65568}, // wrap around 65533,2,4,5
+			want: []rtcp.NackPair{{
+				PacketID:    0, // 65536
+				LostPackets: 1<<4 + 1<<3 + 1<<1,
+			},
+				{
+					PacketID:    30, // 65566
+					LostPackets: 1 << 1,
+				}},
+		},
+		{
 			name: "Must return 2 pairs pair",
 			fields: fields{
 				nacks: nil,
@@ -58,7 +73,7 @@ func Test_nackQueue_pairs(t *testing.T) {
 			for _, sn := range tt.args {
 				n.push(sn)
 			}
-			got, _ := n.pairs(30)
+			got, _ := n.pairs(75530)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("pairs() = %v, want %v", got, tt.want)
 			}

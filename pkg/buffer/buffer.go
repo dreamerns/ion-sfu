@@ -75,11 +75,10 @@ type Buffer struct {
 	lastSRRTPTime      uint32
 	lastSRRecv         int64 // Represents wall clock of the most recent sender report arrival
 	baseSN             uint16
-	cycles             uint32
 	lastRtcpPacketTime int64 // Time the last RTCP packet was received.
 	lastRtcpSrTime     int64 // Time the last RTCP SR was received. Required for DLSR computation.
 	lastTransit        uint32
-	maxSeqNo           uint16 // The highest sequence number received in an RTP data packet
+	seqHdlr            SeqWrapHandler
 
 	stats Stats
 
@@ -273,52 +272,31 @@ func (b *Buffer) OnClose(fn func()) {
 func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 	sn := binary.BigEndian.Uint16(pkt[2:4])
 
+	var headPkt bool
 	if b.stats.PacketCount == 0 {
 		b.baseSN = sn
-		b.maxSeqNo = sn
 		b.lastReport = arrivalTime
-	} else if (sn-b.maxSeqNo)&0x8000 == 0 {
-		if sn < b.maxSeqNo {
-			b.cycles += MaxSN
-		}
+		b.seqHdlr.UpdateMaxSeq(uint32(sn))
+		headPkt = true
+	} else {
+		extSN, isNewer := b.seqHdlr.Unwrap(sn)
 		if b.nack {
-			diff := sn - b.maxSeqNo
-			for i := uint16(1); i < diff; i++ {
-				var extSN uint32
-				msn := sn - i
-				// LK-TODO-START
-				// This check needs validation.
-				// This is meant to handle the case as follows
-				//   maxSeqNo = 65533, sn = 1
-				// which is a wrap around case.
-				// NACKs should be sent for 65534, 65535. Both those sequence
-				// numbers come from the previous cycle, but the check
-				// `b.maxSeqNo&0x8000 == 0` will not be satisfied.
-				//
-				// Looks like this is written for a number wrapping at 15-bits.
-				// LK-TODO-END
-				if msn > b.maxSeqNo && msn&0x8000 > 0 && b.maxSeqNo&0x8000 == 0 {
-					extSN = (b.cycles - MaxSN) | uint32(msn)
-				} else {
-					extSN = b.cycles | uint32(msn)
+			if isNewer {
+				for i := b.seqHdlr.MaxSeqNo() + 1; i < extSN; i++ {
+					b.nacker.push(i)
 				}
-				b.nacker.push(extSN)
+			} else {
+				b.nacker.remove(extSN)
 			}
 		}
-		b.maxSeqNo = sn
-	} else if b.nack && (sn-b.maxSeqNo)&0x8000 > 0 {
-		var extSN uint32
-		// LK-TODO: See note above about checking this condition
-		if sn > b.maxSeqNo && sn&0x8000 > 0 && b.maxSeqNo&0x8000 == 0 {
-			extSN = (b.cycles - MaxSN) | uint32(sn)
-		} else {
-			extSN = b.cycles | uint32(sn)
+		if isNewer {
+			b.seqHdlr.UpdateMaxSeq(extSN)
 		}
-		b.nacker.remove(extSN)
+		headPkt = isNewer
 	}
 
 	var p rtp.Packet
-	pb, err := b.bucket.AddPacket(pkt, sn, sn == b.maxSeqNo)
+	pb, err := b.bucket.AddPacket(pkt, sn, headPkt)
 	if err != nil {
 		if err == errRTXPacket {
 			return
@@ -341,8 +319,8 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 	b.stats.PacketCount++
 
 	ep := ExtPacket{
-		Head:    sn == b.maxSeqNo,
-		Cycle:   b.cycles,
+		Head:    headPkt,
+		Cycle:   b.seqHdlr.Cycles(),
 		Packet:  p,
 		Arrival: arrivalTime,
 	}
@@ -449,7 +427,7 @@ func (b *Buffer) calc(pkt []byte, arrivalTime int64) {
 }
 
 func (b *Buffer) buildNACKPacket() []rtcp.Packet {
-	if nacks, askKeyframe := b.nacker.pairs(b.cycles | uint32(b.maxSeqNo)); (nacks != nil && len(nacks) > 0) || askKeyframe {
+	if nacks, askKeyframe := b.nacker.pairs(b.seqHdlr.MaxSeqNo()); (nacks != nil && len(nacks) > 0) || askKeyframe {
 		var pkts []rtcp.Packet
 		if len(nacks) > 0 {
 			pkts = []rtcp.Packet{&rtcp.TransportLayerNack{
@@ -491,7 +469,7 @@ func (b *Buffer) buildREMBPacket() *rtcp.ReceiverEstimatedMaximumBitrate {
 }
 
 func (b *Buffer) buildReceptionReport() rtcp.ReceptionReport {
-	extMaxSeq := b.cycles | uint32(b.maxSeqNo)
+	extMaxSeq := b.seqHdlr.MaxSeqNo()
 	expected := extMaxSeq - uint32(b.baseSN) + 1
 	lost := uint32(0)
 	if b.stats.PacketCount < expected && b.stats.PacketCount != 0 {
@@ -671,19 +649,67 @@ func (b *Buffer) GetLatestTimestamp() (latestTimestamp uint32, latestTimestampTi
 
 // IsTimestampWrapAround returns true if wrap around happens from timestamp1 to timestamp2
 func IsTimestampWrapAround(timestamp1 uint32, timestamp2 uint32) bool {
-	return (timestamp1&0xC000000 == 0) && (timestamp2&0xC000000 == 0xC000000)
+	return timestamp2 < timestamp1 && timestamp1 > 0xf0000000 && timestamp2 < 0x0fffffff
 }
 
 // IsLaterTimestamp returns true if timestamp1 is later in time than timestamp2 factoring in timestamp wrap-around
 func IsLaterTimestamp(timestamp1 uint32, timestamp2 uint32) bool {
 	if timestamp1 > timestamp2 {
-		if IsTimestampWrapAround(timestamp2, timestamp1) {
+		if IsTimestampWrapAround(timestamp1, timestamp2) {
 			return false
 		}
 		return true
 	}
-	if IsTimestampWrapAround(timestamp1, timestamp2) {
+	if IsTimestampWrapAround(timestamp2, timestamp1) {
 		return true
 	}
 	return false
+}
+
+func isNewerUint16(val1, val2 uint16) bool {
+	return val1 != val2 && val1-val2 < 0x8000
+}
+
+type SeqWrapHandler struct {
+	maxSeqNo uint32
+}
+
+func (s *SeqWrapHandler) Cycles() uint32 {
+	return s.maxSeqNo & 0xffff0000
+}
+
+func (s *SeqWrapHandler) MaxSeqNo() uint32 {
+	return s.maxSeqNo
+}
+
+// unwrap seq and update the maxSeqNo. return unwraped value, and whether seq is newer
+func (s *SeqWrapHandler) Unwrap(seq uint16) (uint32, bool) {
+
+	maxSeqNo := uint16(s.maxSeqNo)
+	delta := int32(seq) - int32(maxSeqNo)
+
+	newer := isNewerUint16(seq, maxSeqNo)
+
+	if newer {
+		if delta < 0 {
+			// seq is newer, but less than maxSeqNo, wrap around
+			delta += 0x10000
+		}
+	} else {
+		// older value
+		if delta > 0 && (int32(s.maxSeqNo)+delta-0x10000) >= 0 {
+			// wrap backwards, should not less than 0 in this case:
+			//   at start time, received seq 1, set s.maxSeqNo =1 ,
+			//   then a out of order seq 65534 coming, we can't unwrap
+			//   the seq to -2
+			delta -= 0x10000
+		}
+	}
+
+	unwrapped := uint32(int32(s.maxSeqNo) + delta)
+	return unwrapped, newer
+}
+
+func (s *SeqWrapHandler) UpdateMaxSeq(extSeq uint32) {
+	s.maxSeqNo = extSeq
 }
