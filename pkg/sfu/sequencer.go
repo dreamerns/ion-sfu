@@ -3,6 +3,8 @@ package sfu
 import (
 	"sync"
 	"time"
+
+	"github.com/pion/ion-sfu/pkg/buffer"
 )
 
 const (
@@ -31,15 +33,45 @@ type packetMeta struct {
 	// Spatial layer of packet
 	layer uint8
 	// Information that differs depending the codec
-	misc uint32
+	misc uint64
 }
 
 func (p *packetMeta) setVP8PayloadMeta(tlz0Idx uint8, picID uint16) {
-	p.misc = uint32(tlz0Idx)<<16 | uint32(picID)
+	p.misc = uint64(tlz0Idx)<<16 | uint64(picID)
 }
 
 func (p *packetMeta) getVP8PayloadMeta() (uint8, uint16) {
 	return uint8(p.misc >> 16), uint16(p.misc)
+}
+
+func (p *packetMeta) packVP8(vp8 *buffer.VP8) {
+	p.misc = uint64(vp8.FirstByte)<<56 |
+		uint64(vp8.PictureIDPresent)<<55 |
+		uint64(vp8.TL0PICIDXPresent)<<54 |
+		uint64(vp8.TIDPresent)<<53 |
+		uint64(vp8.KEYIDXPresent)<<52 |
+		uint64(vp8.PictureID)<<32 |
+		uint64(vp8.TL0PICIDX)<<24 |
+		uint64(vp8.TID)<<22 |
+		uint64(vp8.Y)<<21 |
+		uint64(vp8.KEYIDX)<<16 |
+		uint64(vp8.HeaderSize)<<8
+}
+
+func (p *packetMeta) unpackVP8() *buffer.VP8 {
+	return &buffer.VP8{
+		FirstByte:        byte(p.misc >> 56),
+		PictureIDPresent: int((p.misc >> 55) & 0x1),
+		PictureID:        uint16((p.misc >> 32) & 0xFFFF),
+		TL0PICIDXPresent: int((p.misc >> 54) & 0x1),
+		TL0PICIDX:        uint8((p.misc >> 24) & 0xFF),
+		TIDPresent:       int((p.misc >> 53) & 0x1),
+		TID:              uint8((p.misc >> 22) & 0x3),
+		Y:                uint8((p.misc >> 21) & 0x1),
+		KEYIDXPresent:    int((p.misc >> 52) & 0x1),
+		KEYIDX:           uint8((p.misc >> 16) & 0x1F),
+		HeaderSize:       int((p.misc >> 8) & 0xFF),
+	}
 }
 
 // Sequencer stores the packet sequence received by the down track

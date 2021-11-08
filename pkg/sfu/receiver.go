@@ -515,21 +515,16 @@ func (w *WebRTCReceiver) RetransmitPackets(track *DownTrack, packets []packetMet
 			pkt.Header.Timestamp = meta.timestamp
 			pkt.Header.SSRC = track.ssrc
 			pkt.Header.PayloadType = track.payloadType
-			if track.simulcast.temporalSupported {
-				switch track.mime {
-				case "video/vp8":
-					var vp8 buffer.VP8
-					if err = vp8.Unmarshal(pkt.Payload); err != nil {
-						continue
-					}
-					tlzoID, picID := meta.getVP8PayloadMeta()
-					modifyVP8TemporalPayload(pkt.Payload, vp8.PicIDIdx, vp8.TlzIdx, picID, tlzoID, vp8.MBit)
-				}
+
+			err = track.MaybeTranslateVP8(&pkt, meta)
+			if err != nil {
+				Logger.Error(err, "translating VP8 packet err")
+				continue
 			}
 
 			err = track.WriteRTPHeaderExtensions(&pkt.Header)
 			if err != nil {
-				Logger.Error(err, "Writing rtp header extensions err")
+				Logger.Error(err, "writing rtp header extensions err")
 				continue
 			}
 

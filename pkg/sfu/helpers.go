@@ -15,6 +15,7 @@ var (
 
 type ntpTime uint64
 
+// LK-TODO: CLEANUP-REMOVE-FUNCTION
 // setVp8TemporalLayer is a helper to detect and modify accordingly the vp8 payload to reflect
 // temporal changes in the SFU.
 // VP8 temporal layers implemented according https://tools.ietf.org/html/rfc7741
@@ -54,6 +55,7 @@ func setVP8TemporalLayer(p *buffer.ExtPacket, d *DownTrack) (buf []byte, picID u
 	return
 }
 
+// LK-TODO: CLEANUP-REMOVE-FUNCTION
 func modifyVP8TemporalPayload(payload []byte, picIDIdx, tlz0Idx int, picID uint16, tlz0ID uint8, mBit bool) {
 	pid := make([]byte, 2)
 	binary.BigEndian.PutUint16(pid, picID)

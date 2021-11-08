@@ -45,17 +45,29 @@ func (a *atomicBool) get() bool {
 			+-+-+-+-+-+-+-+-+
 */
 type VP8 struct {
-	TemporalSupported bool
-	// Optional Header
-	PictureID uint16 /* 8 or 16 bits, picture ID */
-	PicIDIdx  int
-	MBit      bool
-	TL0PICIDX uint8 /* 8 bits temporal level zero index */
-	TlzIdx    int
+	TemporalSupported bool // LK-TODO: CLEANUP-REMOVE
+	FirstByte         byte
+
+	PictureIDPresent int
+	PictureID        uint16 /* 8 or 16 bits, picture ID */
+	PicIDIdx         int    // LK-TODO: CLEANUP-REMOVE
+	MBit             bool
+
+	TL0PICIDXPresent int
+	TL0PICIDX        uint8 /* 8 bits temporal level zero index */
+	TlzIdx           int   // LK-TODO: CLEANUP-REMOVE
 
 	// Optional Header If either of the T or K bits are set to 1,
 	// the TID/Y/KEYIDX extension field MUST be present.
-	TID uint8 /* 2 bits temporal layer idx*/
+	TIDPresent int
+	TID        uint8 /* 2 bits temporal layer idx */
+	Y          uint8
+
+	KEYIDXPresent int
+	KEYIDX        uint8 /* 5 bits of key frame idx */
+
+	HeaderSize int
+
 	// IsKeyFrame is a helper to detect if current packet is a keyframe
 	IsKeyFrame bool
 }
@@ -73,6 +85,7 @@ func (p *VP8) Unmarshal(payload []byte) error {
 	}
 
 	idx := 0
+	p.FirstByte = payload[idx]
 	S := payload[idx]&0x10 > 0
 	// Check for extended bit control
 	if payload[idx]&0x80 > 0 {
@@ -80,20 +93,23 @@ func (p *VP8) Unmarshal(payload []byte) error {
 		if payloadLen < idx+1 {
 			return errShortPacket
 		}
-		// Check if T is present, if not, no temporal layer is available
-		p.TemporalSupported = payload[idx]&0x20 > 0
-		K := payload[idx]&0x10 > 0
+		I := payload[idx]&0x80 > 0
 		L := payload[idx]&0x40 > 0
-		if L && !p.TemporalSupported {
+		T := payload[idx]&0x20 > 0
+		K := payload[idx]&0x10 > 0
+		if L && !T {
 			return errInvalidPacket
 		}
+		// Check if T is present, if not, no temporal layer is available
+		p.TemporalSupported = payload[idx]&0x20 > 0
 		// Check for PictureID
-		if payload[idx]&0x80 > 0 {
+		if I {
 			idx++
 			if payloadLen < idx+1 {
 				return errShortPacket
 			}
 			p.PicIDIdx = idx
+			p.PictureIDPresent = 1
 			pid := payload[idx] & 0x7f
 			// Check if m is 1, then Picture ID is 15 bits
 			if payload[idx]&0x80 > 0 {
@@ -114,19 +130,26 @@ func (p *VP8) Unmarshal(payload []byte) error {
 				return errShortPacket
 			}
 			p.TlzIdx = idx
+			p.TL0PICIDXPresent = 1
 
 			if int(idx) >= payloadLen {
 				return errShortPacket
 			}
 			p.TL0PICIDX = payload[idx]
 		}
-		if p.TemporalSupported || K {
+		if T || K {
 			idx++
 			if payloadLen < idx+1 {
 				return errShortPacket
 			}
-			if p.TemporalSupported {
+			if T {
+				p.TIDPresent = 1
 				p.TID = (payload[idx] & 0xc0) >> 6
+				p.Y = (payload[idx] & 0x20) >> 5
+			}
+			if K {
+				p.KEYIDXPresent = 1
+				p.KEYIDX = payload[idx] & 0x1f
 			}
 		}
 		if idx >= payloadLen {
@@ -146,7 +169,64 @@ func (p *VP8) Unmarshal(payload []byte) error {
 		// Check is packet is a keyframe by looking at P bit in vp8 payload
 		p.IsKeyFrame = payload[idx]&0x01 == 0 && S
 	}
+	p.HeaderSize = idx
 	return nil
+}
+
+func (v *VP8) MarshalTo(buf []byte) error {
+	if len(buf) < v.HeaderSize {
+		return errShortPacket
+	}
+
+	idx := 0
+	buf[idx] = v.FirstByte
+	if (v.PictureIDPresent + v.TL0PICIDXPresent + v.TIDPresent + v.KEYIDXPresent) != 0 {
+		buf[idx] |= 0x80 // X bit
+		idx++
+		buf[idx] = byte(v.PictureIDPresent<<7) | byte(v.TL0PICIDXPresent<<6) | byte(v.TIDPresent<<5) | byte(v.KEYIDXPresent<<4)
+		idx++
+		if v.PictureIDPresent == 1 {
+			if v.MBit {
+				buf[idx] = 0x80 | byte((v.PictureID>>8)&0x7f)
+				buf[idx+1] = byte(v.PictureID & 0xff)
+				idx += 2
+			} else {
+				buf[idx] = byte(v.PictureID)
+				idx++
+			}
+		}
+		if v.TL0PICIDXPresent == 1 {
+			buf[idx] = byte(v.TL0PICIDX)
+			idx++
+		}
+		if v.TIDPresent == 1 || v.KEYIDXPresent == 1 {
+			buf[idx] = 0
+			if v.TIDPresent == 1 {
+				buf[idx] = byte(v.TID<<6) | byte(v.Y<<5)
+			}
+			if v.KEYIDXPresent == 1 {
+				buf[idx] |= byte(v.KEYIDX & 0x1f)
+			}
+			idx++
+		}
+	} else {
+		buf[idx] &^= 0x80 // X bit
+		idx++
+	}
+
+	return nil
+}
+
+func VP8PictureIdSizeDiff(mBit1 bool, mBit2 bool) int {
+	if mBit1 == mBit2 {
+		return 0
+	}
+
+	if mBit1 {
+		return 1
+	}
+
+	return -1
 }
 
 // isH264Keyframe detects if h264 payload is a keyframe
