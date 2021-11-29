@@ -113,7 +113,7 @@ func SubscriberAPI(next sfu.MessageProcessor) sfu.MessageProcessor {
 					downTracks := peer.Subscriber().GetDownTracks(srm.StreamID)
 					for _, dt := range downTracks {
 						if dt.Kind() == webrtc.RTPCodecTypeVideo {
-							newLayer, _ := dt.UptrackLayersChange(layers)
+							newLayer, _ := dt.UptrackLayersChange(layers, true)
 							sendMessage(srm.StreamID, peer, srm.Layers, int(newLayer))
 						}
 					}
